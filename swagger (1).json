@@ -1,0 +1,212 @@
+{
+    "swagger": "2.0",
+    "info": {
+        "version": "1.0.0",
+        "title": "Document API",
+        "description": "API suite providing company filing history document metadata and downloads."
+    },
+    "host": "document-api.company-information.service.gov.uk",
+    "schemes": [
+        "https",
+        "http"
+    ],
+    "consumes": [
+        "application/json"
+    ],
+    "produces": [
+        "application/json"
+    ],
+    "tags": [
+        {
+            "name": "documentMetadata",
+            "description": "Document Metadata"
+        },
+        {
+            "name": "documentLocation",
+            "description": "Document Location"
+        }
+    ],
+    "securityDefinitions": {
+        "api_key": {
+            "type": "apiKey",
+            "name": "api_key",
+            "in": "header"
+        }
+    },
+    "security": [
+        {
+            "api_key": []
+        }
+    ],
+    "paths": {
+        "/document/{document_id}": {
+            "get": {
+                "summary": "Fetch a document's metadata",
+                "description": "Fetch a document's metadata",
+                "tags": [
+                    "documentMetadata"
+                ],
+                "parameters": [
+                    {
+                        "name": "document_id",
+                        "in": "path",
+                        "description": "the id of the document",
+                        "required": true,
+                        "type": "string"
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "Document metadata",
+                        "schema": {
+                            "$ref": "#/definitions/documentMetadata"
+                        }
+                    },
+                    "401": {
+                        "description": "Not authorised to retrieve document metadata"
+                    }
+                }
+            }
+        },
+        "/document/{document_id}/content": {
+            "get": {
+                "summary": "Fetch a document",
+                "description": "Fetch a document",
+                "tags": [
+                    "documentLocation"
+                ],
+                "parameters": [
+                    {
+                        "name": "document_id",
+                        "in": "path",
+                        "description": "the id of the document",
+                        "required": true,
+                        "type": "string"
+                    },
+                    {
+                        "name": "Accept",
+                        "description": "Gives the Content-Type that the document will be returned as. If the Content-Type is unsupported, a 406 error will be generated. The Content-Types that the document is available as can be found by requesting the metadata for the document.",
+                        "in": "header",
+                        "required": true,
+                        "type": "string"
+                    }
+                ],
+                "responses": {
+                    "302": {
+                        "description": "Document location",
+                        "headers": {
+                            "Location": {
+                                "description": "A redirect is being made to the resource to be returned",
+                                "type": "string"
+                            }
+                        }
+                    },
+                    "401": {
+                        "description": "Not authorised to retrieve document"
+                    }
+                }
+            }
+        }
+    },
+    "definitions": {
+        "documentMetadata": {
+            "title": "documentMetadata",
+            "required": [
+                "etag",
+                "created_at",
+                "id",
+                "links",
+                "company_number"
+            ],
+            "properties": {
+                "etag": {
+                    "type": "string",
+                    "description": "The ETag of the resource."
+                },
+                "created_at": {
+                    "type": "string",
+                    "format": "date-time",
+                    "description": "The date and time the document was first created"
+                },
+                "updated_at": {
+                    "type": "string",
+                    "format": "date-time",
+                    "description": "The date and time the document was last updated"
+                },
+                "id": {
+                    "type": "string",
+                    "description": "The document ID."
+                },
+                "pages": {
+                    "type": "number",
+                    "description": "The document page count"
+                },
+                "links": {
+                    "description": "Links to other resources associated with this filing history item.",
+                    "items": {
+                        "$ref": "#/definitions/filingHistoryItemLinks"
+                    },
+                    "type": "object"
+                },
+                "resources": {
+                    "type": "object",
+                    "description": "The list of content-types that the document is available as, and associated type specific information",
+                    "items": {
+                        "$ref": "#/definitions/resourcesModel"
+                    }
+                }
+            }
+        },
+        "filingHistoryItemLinks": {
+            "title": "filingHistoryItemLinks",
+            "properties": {
+                "self": {
+                    "description": "Link to this document.",
+                    "type": "string"
+                },
+                "document": {
+                    "description": "Link to the document metadata associated with this document.",
+                    "type": "string"
+                }
+            }
+        },
+        "resourcesModel": {
+            "title": "resourcesModel",
+            "required": [
+                "{content_type}"
+            ],
+            "properties": {
+                "{content_type}": {
+                    "type": "object",
+                    "description": "The content-type (MIME type) that the document is available as. Not all content types will be available for all documents. Available content types are `application/pdf`, `application/json`, `application/xml`, `application/xhtml+xml`, `application/zip` and `text/csv`",
+                    "items": {
+                        "$ref": "#/definitions/resourceContent"
+                    }
+                }
+            }
+        },
+        "resourceContent": {
+            "title": "resourceContent",
+            "required": [
+                "content_length",
+                "created_at"
+            ],
+            "properties": {
+                "content_length": {
+                    "type": "number",
+                    "description": "The size of the document when returned as this content-type."
+                },
+                "created_at": {
+                    "type": "string",
+                    "format": "date-time",
+                    "description": "The date and time this document type was first created"
+                },
+                "updated_at": {
+                    "type": "string",
+                    "format": "date-time",
+                    "description": "The date and time the document type was last updated"
+                }
+            }
+        }
+    }
+}
