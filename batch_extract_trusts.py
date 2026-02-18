@@ -12,7 +12,7 @@ from pathlib import Path
 from typing import Any
 from zipfile import ZipFile
 
-from companies_house_client import CompaniesHouseClient, FilingDocumentType
+from companies_house_client import CompaniesHouseClient
 from document_extraction_models import ExtractionType
 from openrouter_document_extractor import DocumentExtractionError, OpenRouterDocumentExtractor
 
@@ -243,6 +243,35 @@ def _estimate_llm_tokens_for_pdf_bytes(pdf_size_bytes: int) -> int:
     if pdf_size_bytes <= 0:
         return 0
     return int(math.ceil(pdf_size_bytes / 4.0))
+
+
+def _is_full_accounts_filing(item: dict[str, Any]) -> bool:
+    filing_type = str(item.get("type") or "").upper()
+    description = str(item.get("description") or "").lower()
+    if filing_type != "AA":
+        return False
+    return "accounts-with-accounts-type-full" in description or "full" in description
+
+
+def _latest_full_accounts_document_id_from_filing_history(
+    filings: list[dict[str, Any]],
+) -> str | None:
+    candidates: list[dict[str, Any]] = []
+    for item in filings:
+        if not _is_full_accounts_filing(item):
+            continue
+        links = item.get("links") or {}
+        metadata_url = str(links.get("document_metadata") or "").strip()
+        if not metadata_url:
+            continue
+        candidates.append(item)
+
+    if not candidates:
+        return None
+
+    latest_item = sorted(candidates, key=lambda i: (str(i.get("date") or "")), reverse=True)[0]
+    metadata_url = str((latest_item.get("links") or {}).get("document_metadata") or "").strip()
+    return CompaniesHouseClient._extract_document_id(metadata_url)
 
 
 def _extract_with_model_fallback(
@@ -675,16 +704,9 @@ def main() -> int:
             stage = "profile_ok"
             filing_history = client.get_all_filing_history(company_number=company_number)
             stage = "filing_history_ok"
-            latest_doc = client.get_latest_document(
-                company_number=company_number,
-                document_type=FilingDocumentType.FULL_ACCOUNTS,
-            )
-            if latest_doc is None:
-                raise ValueError("No full accounts document found")
-
-            document_id = str(latest_doc.get("document_id") or "").strip()
+            document_id = _latest_full_accounts_document_id_from_filing_history(filing_history)
             if not document_id:
-                raise ValueError("Latest full accounts document missing document_id")
+                raise ValueError("No full accounts document found")
             stage = "latest_document_ok"
 
             pdf_path = doc_dir / f"{company_number}_latest_full_accounts_{document_id}.pdf"
