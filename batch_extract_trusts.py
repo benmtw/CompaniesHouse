@@ -555,6 +555,12 @@ def build_parser() -> argparse.ArgumentParser:
         help="Write a run-level summary.json file with per-company outcomes and metrics",
     )
     parser.add_argument(
+        "--filing-history-items-per-page",
+        type=int,
+        default=100,
+        help="Filing history page size used for latest full-accounts selection (default 100)",
+    )
+    parser.add_argument(
         "--summary-json-path",
         default="",
         help="Optional explicit path for summary JSON (defaults to <run_dir>/summary.json when enabled)",
@@ -582,6 +588,8 @@ def main() -> int:
         )
     if args.ch_min_request_interval_seconds < 0:
         raise ValueError("ch_min_request_interval_seconds must be >= 0")
+    if args.filing_history_items_per_page <= 0:
+        raise ValueError("filing_history_items_per_page must be > 0")
 
     output_root = Path(args.output_root)
     run_stamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
@@ -658,6 +666,11 @@ def main() -> int:
             run_id, args.ch_min_request_interval_seconds
         )
     )
+    print(
+        "[run {}] filing_history_items_per_page={}".format(
+            run_id, args.filing_history_items_per_page
+        )
+    )
 
     client = CompaniesHouseClient(api_key=ch_api_key)
     throttle_state = _install_companies_house_request_throttle(
@@ -702,7 +715,12 @@ def main() -> int:
         try:
             profile = client.get_company_profile(company_number)
             stage = "profile_ok"
-            filing_history = client.get_all_filing_history(company_number=company_number)
+            filing_history_page = client.get_filing_history(
+                company_number=company_number,
+                items_per_page=args.filing_history_items_per_page,
+                start_index=0,
+            )
+            filing_history = filing_history_page.get("items") or []
             stage = "filing_history_ok"
             document_id = _latest_full_accounts_document_id_from_filing_history(filing_history)
             if not document_id:

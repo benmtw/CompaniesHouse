@@ -388,6 +388,7 @@ Useful controls:
 - `--ch-min-request-interval-seconds 2.0` minimum delay between Companies House HTTP requests (default is `2.0`, which is ~25% of the documented `600/5min` limit). Set `0` to disable pacing.
 - `--write-summary-json` to emit run-level `summary.json` in the run folder
 - `--summary-json-path "<path>"` optional explicit location for summary JSON
+- `--filing-history-items-per-page 100` fetches only the first filing-history page for latest full-accounts selection (faster and lower request volume)
 
 Per-run output layout:
 - `output\trusts_extraction\run_<UTCSTAMP>\<company_number>\documents\<company_number>_latest_full_accounts_<document_id>.pdf`
