@@ -275,13 +275,28 @@ Required env variables:
 
 Current extraction behavior:
 - `extract_latest_full_accounts(...)` selects the latest `FilingDocumentType.FULL_ACCOUNTS` document only for retrieval.
-- Extraction itself is requested independently via `ExtractionType`:
-  - `ExtractionType.PersonnelDetails` -> `first_name`, `last_name`, `job_title`
-  - `ExtractionType.BalanceSheet` -> `line_item`, `value`, nullable `period`, nullable `currency`
+- `extract_latest_mat_annual_report(...)` is a convenience wrapper that calls `extract_latest_full_accounts(...)` with `ExtractionType.AcademyTrustAnnualReport`.
+- Extraction itself is requested independently via `ExtractionType` (you can pass one or many):
+  - `ExtractionType.PersonnelDetails` -> `personnel_details[]`
+  - `ExtractionType.BalanceSheet` -> legacy `balance_sheet[]` line-item output
+  - `ExtractionType.Metadata` -> `metadata`
+  - `ExtractionType.Governance` -> `governance`
+  - `ExtractionType.StatementOfFinancialActivities` -> `statement_of_financial_activities`
+  - `ExtractionType.DetailedBalanceSheet` -> `detailed_balance_sheet`
+  - `ExtractionType.StaffingData` -> `staffing_data`
+  - `ExtractionType.AcademyTrustAnnualReport` -> `academy_trust_annual_report` (full MAT object)
+- MAT numeric fields are normalized during model parsing:
+  - Supports commas, `£/$/€`, parenthesized negatives, and null-like placeholders (`-`, `—`, `N/A`, `null`).
 - The extractor sends the downloaded document file directly to OpenRouter chat completions as message content `type: "file"` with `file.file_data` data URI.
 - No local PDF parsing/text extraction is performed in this project.
 - OpenRouter structured output is enforced with `response_format.type = "json_schema"` and strict schema mode.
 - OpenRouter provider preferences set `require_parameters = false` for model-specific compatibility and lower-friction routing.
+- `ExtractionResult.validation_warnings` contains non-fatal reconciliation warnings. Extraction continues even when warnings are present.
+- Reconciliation warning checks currently include:
+  - SOFA fund component sums vs reported `total`.
+  - Detailed balance sheet computed net assets vs reported `net_assets`.
+  - Top-level `detailed_balance_sheet` vs nested `academy_trust_annual_report.balance_sheet` mismatch.
+- Reconciliation tolerance is absolute difference `> 1` (to reduce false positives from rounding).
 
 PowerShell example:
 
@@ -297,7 +312,7 @@ from companies_house_client import (
 client = CompaniesHouseClient(api_key=os.getenv("CH_API_KEY"))
 extractor = OpenRouterDocumentExtractor(
     api_key=os.getenv("OPENROUTER_API_KEY"),
-    model=os.getenv("OPENROUTER_MODEL", "openrouter/auto"),
+    model=os.getenv("OPENROUTER_MODEL", "openai/gpt-4o-mini"),
 )
 
 result = client.extract_latest_full_accounts(
@@ -314,3 +329,53 @@ print("Personnel:", [p.model_dump() for p in (result.personnel_details or [])])
 print("Balance sheet:", [b.model_dump() for b in (result.balance_sheet or [])])
 '@ | .\.venv\Scripts\python -
 ```
+
+MAT full report example:
+
+```powershell
+@'
+import os
+from companies_house_client import CompaniesHouseClient, OpenRouterDocumentExtractor
+
+client = CompaniesHouseClient(api_key=os.getenv("CH_API_KEY"))
+extractor = OpenRouterDocumentExtractor(
+    api_key=os.getenv("OPENROUTER_API_KEY"),
+    model=os.getenv("OPENROUTER_MODEL", "openai/gpt-4o-mini"),
+)
+
+result = client.extract_latest_mat_annual_report(
+    company_number="09618502",
+    output_path="output\\09618502\\latest_full_accounts.pdf",
+    extractor=extractor,
+)
+
+print("Warnings:", result.validation_warnings)
+report = result.academy_trust_annual_report
+print("MAT report keys:", list(report.model_dump().keys()) if report else [])
+'@ | .\.venv\Scripts\python -
+```
+
+## 12) Smoke Test And Final Validation
+
+Unit test command:
+
+```powershell
+.\.venv\Scripts\python -m unittest -v test_companies_house_client.py
+```
+
+Expected baseline:
+- Unit tests pass without network access.
+- Live smoke tests are skipped when `CH_API_KEY` is not set.
+- Live extraction smoke test is skipped when `OPENROUTER_API_KEY` is not set.
+
+Live smoke guidance:
+1. Set `CH_API_KEY` in `.env`.
+2. Set `OPENROUTER_API_KEY` in `.env` for extraction smoke.
+3. Set a specific low-cost model in `.env` (example: `OPENROUTER_MODEL=openai/gpt-4o-mini`).
+4. Re-run `.\.venv\Scripts\python -m unittest -v test_companies_house_client.py`.
+
+Known limitations:
+- `validation_warnings` are advisory only; they do not fail extraction.
+- Reconciliation uses tolerance `abs(diff) > 1`; small rounding differences are ignored.
+- Warnings only run when all required numeric inputs for the specific check are present.
+- LLM extraction quality depends on model output and document quality/layout.

@@ -5,12 +5,15 @@ import unittest
 from unittest.mock import Mock, patch
 
 from companies_house_client import (
+    AcademyTrustAnnualReport,
     CompaniesHouseApiError,
     CompaniesHouseClient,
+    DetailedBalanceSheet,
     DocumentExtractionError,
     ExtractionResult,
     ExtractionType,
     FilingDocumentType,
+    Metadata,
     OpenRouterDocumentExtractor,
     PersonnelDetail,
 )
@@ -386,6 +389,31 @@ class CompaniesHouseClientTests(unittest.TestCase):
                 extraction_types=[ExtractionType.BalanceSheet],
             )
 
+    def test_extract_latest_mat_annual_report_wrapper_uses_expected_type(self):
+        client = CompaniesHouseClient(api_key="k")
+        expected = ExtractionResult(
+            source_path="C:\\tmp\\full_accounts.pdf",
+            model="openai/gpt-4o-mini",
+            requested_types=[ExtractionType.AcademyTrustAnnualReport],
+        )
+        client.extract_latest_full_accounts = Mock(return_value=expected)
+        extractor = Mock()
+
+        out = client.extract_latest_mat_annual_report(
+            company_number="11124272",
+            output_path="C:\\tmp\\full_accounts.pdf",
+            extractor=extractor,
+        )
+
+        self.assertEqual(out, expected)
+        client.extract_latest_full_accounts.assert_called_once_with(
+            company_number="11124272",
+            output_path="C:\\tmp\\full_accounts.pdf",
+            extractor=extractor,
+            extraction_types=[ExtractionType.AcademyTrustAnnualReport],
+            accept="application/pdf",
+        )
+
 
 class OpenRouterDocumentExtractorTests(unittest.TestCase):
     def test_extract_personnel_only(self):
@@ -477,6 +505,375 @@ class OpenRouterDocumentExtractorTests(unittest.TestCase):
         self.assertEqual(
             fields["line_item"]["description"], "Balance sheet line item name."
         )
+
+    def test_extract_metadata_only(self):
+        extractor = OpenRouterDocumentExtractor(api_key="or_key")
+        llm_json = """
+        {
+          "metadata": {
+            "trust_name": "ACORN MULTI ACADEMY TRUST",
+            "company_registration_number": "09253218",
+            "financial_year_ending": "2024-08-31",
+            "accounting_officer": "Jane Smith"
+          }
+        }
+        """
+        response = {
+            "choices": [{"message": {"content": llm_json}}],
+        }
+        extractor._post_openrouter_chat_completion = Mock(return_value=response)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "full_accounts.txt")
+            with open(path, "w", encoding="utf-8") as fh:
+                fh.write("Sample full accounts text")
+
+            result = extractor.extract(
+                path,
+                extraction_types=[ExtractionType.Metadata],
+            )
+
+        self.assertIsNone(result.personnel_details)
+        self.assertIsNone(result.balance_sheet)
+        self.assertIsNotNone(result.metadata)
+        self.assertIsInstance(result.metadata, Metadata)
+        self.assertEqual(result.metadata.trust_name, "ACORN MULTI ACADEMY TRUST")
+        self.assertEqual(result.metadata.company_registration_number, "09253218")
+        self.assertEqual(result.metadata.financial_year_ending, "2024-08-31")
+        payload = extractor._post_openrouter_chat_completion.call_args[1]["payload"]
+        schema = payload["response_format"]["json_schema"]["schema"]
+        self.assertIn("metadata", schema["required"])
+        metadata_fields = schema["properties"]["metadata"]["properties"]
+        self.assertEqual(metadata_fields["company_registration_number"]["pattern"], "^[0-9]{8}$")
+
+    def test_extract_academy_trust_annual_report_only(self):
+        extractor = OpenRouterDocumentExtractor(api_key="or_key")
+        llm_json = """
+        {
+          "academy_trust_annual_report": {
+            "metadata": {
+              "trust_name": "ACORN MULTI ACADEMY TRUST",
+              "company_registration_number": "09253218",
+              "financial_year_ending": "2024-08-31",
+              "accounting_officer": "Jane Smith"
+            },
+            "governance": {
+              "trustees": [
+                {"name": "Ada Lovelace", "meetings_attended": 5, "meetings_possible": 6}
+              ]
+            },
+            "statement_of_financial_activities": {
+              "income": {
+                "donations_and_capital_grants": {
+                  "unrestricted_funds": 23673,
+                  "restricted_general_funds": 214000,
+                  "restricted_fixed_asset_funds": 3101812,
+                  "total": 3339485
+                },
+                "charitable_activities_education": null,
+                "other_trading_activities": null,
+                "investments": null
+              },
+              "expenditure": {
+                "charitable_activities_education": null
+              }
+            },
+            "balance_sheet": {
+              "fixed_assets": 7530887,
+              "current_assets": {
+                "debtors": 300689,
+                "cash_at_bank": 983289
+              },
+              "liabilities": {
+                "creditors_within_one_year": 200000,
+                "pension_scheme_liability": 132000
+              },
+              "net_assets": 8187176
+            },
+            "staffing_data": {
+              "average_headcount_fte": 101,
+              "total_staff_costs": 4500000,
+              "high_pay_bands": [
+                {"band_range": "£70,001 - £80,000", "count": 1}
+              ]
+            }
+          }
+        }
+        """
+        response = {
+            "choices": [{"message": {"content": llm_json}}],
+        }
+        extractor._post_openrouter_chat_completion = Mock(return_value=response)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "full_accounts.txt")
+            with open(path, "w", encoding="utf-8") as fh:
+                fh.write("Sample full accounts text")
+
+            result = extractor.extract(
+                path,
+                extraction_types=[ExtractionType.AcademyTrustAnnualReport],
+            )
+
+        self.assertIsNotNone(result.academy_trust_annual_report)
+        self.assertIsInstance(result.academy_trust_annual_report, AcademyTrustAnnualReport)
+        self.assertIsInstance(result.academy_trust_annual_report.balance_sheet, DetailedBalanceSheet)
+        self.assertEqual(
+            result.academy_trust_annual_report.metadata.company_registration_number,
+            "09253218",
+        )
+        self.assertEqual(
+            result.academy_trust_annual_report.balance_sheet.current_assets.cash_at_bank,
+            983289,
+        )
+        payload = extractor._post_openrouter_chat_completion.call_args[1]["payload"]
+        schema = payload["response_format"]["json_schema"]["schema"]
+        self.assertIn("academy_trust_annual_report", schema["required"])
+        annual_report_props = schema["properties"]["academy_trust_annual_report"]["properties"]
+        self.assertIn("statement_of_financial_activities", annual_report_props)
+        self.assertIn("balance_sheet", annual_report_props)
+
+    def test_mat_numeric_normalization_parses_accounting_formats(self):
+        extractor = OpenRouterDocumentExtractor(api_key="or_key")
+        llm_json = """
+        {
+          "academy_trust_annual_report": {
+            "metadata": {
+              "trust_name": "ACORN MULTI ACADEMY TRUST",
+              "company_registration_number": "09253218",
+              "financial_year_ending": "2024-08-31",
+              "accounting_officer": "Jane Smith"
+            },
+            "governance": {
+              "trustees": [
+                {"name": "Ada Lovelace", "meetings_attended": "6", "meetings_possible": "6"}
+              ]
+            },
+            "statement_of_financial_activities": {
+              "income": {
+                "donations_and_capital_grants": {
+                  "unrestricted_funds": "£23,673",
+                  "restricted_general_funds": "214,000",
+                  "restricted_fixed_asset_funds": "(3,101,812)",
+                  "total": "-2,864,139"
+                },
+                "charitable_activities_education": null,
+                "other_trading_activities": null,
+                "investments": null
+              },
+              "expenditure": {
+                "charitable_activities_education": null
+              }
+            },
+            "balance_sheet": {
+              "fixed_assets": "7,530,887",
+              "current_assets": {
+                "debtors": "300,689",
+                "cash_at_bank": "983,289"
+              },
+              "liabilities": {
+                "creditors_within_one_year": "200,000",
+                "pension_scheme_liability": "132,000"
+              },
+              "net_assets": "8,482,865"
+            },
+            "staffing_data": {
+              "average_headcount_fte": "101",
+              "total_staff_costs": "£4,500,000",
+              "high_pay_bands": [
+                {"band_range": "£70,001 - £80,000", "count": "1"}
+              ]
+            }
+          }
+        }
+        """
+        response = {
+            "choices": [{"message": {"content": llm_json}}],
+        }
+        extractor._post_openrouter_chat_completion = Mock(return_value=response)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "full_accounts.txt")
+            with open(path, "w", encoding="utf-8") as fh:
+                fh.write("Sample full accounts text")
+
+            result = extractor.extract(
+                path,
+                extraction_types=[ExtractionType.AcademyTrustAnnualReport],
+            )
+
+        report = result.academy_trust_annual_report
+        self.assertIsNotNone(report)
+        self.assertEqual(report.governance.trustees[0].meetings_attended, 6)
+        self.assertEqual(
+            report.statement_of_financial_activities.income.donations_and_capital_grants.unrestricted_funds,
+            23673.0,
+        )
+        self.assertEqual(
+            report.statement_of_financial_activities.income.donations_and_capital_grants.restricted_fixed_asset_funds,
+            -3101812.0,
+        )
+        self.assertEqual(report.staffing_data.high_pay_bands[0].count, 1)
+
+    def test_reconciliation_warnings_for_sofa_and_balance_sheet(self):
+        extractor = OpenRouterDocumentExtractor(api_key="or_key")
+        llm_json = """
+        {
+          "statement_of_financial_activities": {
+            "income": {
+              "donations_and_capital_grants": {
+                "unrestricted_funds": 100,
+                "restricted_general_funds": 50,
+                "restricted_fixed_asset_funds": 25,
+                "total": 100
+              },
+              "charitable_activities_education": null,
+              "other_trading_activities": null,
+              "investments": null
+            },
+            "expenditure": {
+              "charitable_activities_education": null
+            }
+          },
+          "detailed_balance_sheet": {
+            "fixed_assets": 1000,
+            "current_assets": {
+              "debtors": 200,
+              "cash_at_bank": 300
+            },
+            "liabilities": {
+              "creditors_within_one_year": 100,
+              "pension_scheme_liability": 50
+            },
+            "net_assets": 1200
+          }
+        }
+        """
+        response = {
+            "choices": [{"message": {"content": llm_json}}],
+        }
+        extractor._post_openrouter_chat_completion = Mock(return_value=response)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "full_accounts.txt")
+            with open(path, "w", encoding="utf-8") as fh:
+                fh.write("Sample full accounts text")
+
+            result = extractor.extract(
+                path,
+                extraction_types=[
+                    ExtractionType.StatementOfFinancialActivities,
+                    ExtractionType.DetailedBalanceSheet,
+                ],
+            )
+
+        self.assertEqual(len(result.validation_warnings), 2)
+        self.assertIn(
+            "statement_of_financial_activities.income.donations_and_capital_grants total mismatch",
+            result.validation_warnings[0],
+        )
+        self.assertIn(
+            "detailed_balance_sheet net_assets mismatch",
+            result.validation_warnings[1],
+        )
+
+    def test_reconciliation_warning_for_detailed_balance_sheet_mismatch_between_sections(self):
+        extractor = OpenRouterDocumentExtractor(api_key="or_key")
+        llm_json = """
+        {
+          "detailed_balance_sheet": {
+            "fixed_assets": 1000,
+            "current_assets": {
+              "debtors": 200,
+              "cash_at_bank": 300
+            },
+            "liabilities": {
+              "creditors_within_one_year": 100,
+              "pension_scheme_liability": 50
+            },
+            "net_assets": 1350
+          },
+          "academy_trust_annual_report": {
+            "metadata": {
+              "trust_name": "ACORN MULTI ACADEMY TRUST",
+              "company_registration_number": "09253218",
+              "financial_year_ending": "2024-08-31",
+              "accounting_officer": "Jane Smith"
+            },
+            "governance": {"trustees": []},
+            "statement_of_financial_activities": {
+              "income": {
+                "donations_and_capital_grants": null,
+                "charitable_activities_education": null,
+                "other_trading_activities": null,
+                "investments": null
+              },
+              "expenditure": {"charitable_activities_education": null}
+            },
+            "balance_sheet": {
+              "fixed_assets": 1000,
+              "current_assets": {
+                "debtors": 200,
+                "cash_at_bank": 300
+              },
+              "liabilities": {
+                "creditors_within_one_year": 100,
+                "pension_scheme_liability": 50
+              },
+              "net_assets": 1200
+            },
+            "staffing_data": {
+              "average_headcount_fte": null,
+              "total_staff_costs": null,
+              "high_pay_bands": []
+            }
+          }
+        }
+        """
+        response = {
+            "choices": [{"message": {"content": llm_json}}],
+        }
+        extractor._post_openrouter_chat_completion = Mock(return_value=response)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "full_accounts.txt")
+            with open(path, "w", encoding="utf-8") as fh:
+                fh.write("Sample full accounts text")
+
+            result = extractor.extract(
+                path,
+                extraction_types=[
+                    ExtractionType.DetailedBalanceSheet,
+                    ExtractionType.AcademyTrustAnnualReport,
+                ],
+            )
+
+        self.assertTrue(
+            any(
+                "Detailed balance sheet differs between top-level `detailed_balance_sheet`"
+                in warning
+                for warning in result.validation_warnings
+            )
+        )
+
+    def test_build_response_schema_for_individual_mat_sections(self):
+        schema = OpenRouterDocumentExtractor._build_response_format(
+            [
+                ExtractionType.Metadata,
+                ExtractionType.Governance,
+                ExtractionType.StatementOfFinancialActivities,
+                ExtractionType.DetailedBalanceSheet,
+                ExtractionType.StaffingData,
+            ]
+        )["json_schema"]["schema"]
+
+        self.assertIn("metadata", schema["required"])
+        self.assertIn("governance", schema["required"])
+        self.assertIn("statement_of_financial_activities", schema["required"])
+        self.assertIn("detailed_balance_sheet", schema["required"])
+        self.assertIn("staffing_data", schema["required"])
+        self.assertNotIn("academy_trust_annual_report", schema["required"])
+        self.assertNotIn("balance_sheet", schema["required"])
 
     def test_extract_rejects_missing_personnel_fields(self):
         extractor = OpenRouterDocumentExtractor(api_key="or_key")

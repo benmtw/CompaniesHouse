@@ -9,10 +9,16 @@ import requests
 from pydantic import ValidationError
 
 from document_extraction_models import (
+    AcademyTrustAnnualReport,
     BalanceSheetEntry,
+    DetailedBalanceSheet,
     ExtractionResult,
     ExtractionType,
+    Governance,
+    Metadata,
     PersonnelDetail,
+    StaffingData,
+    StatementOfFinancialActivities,
 )
 
 
@@ -117,6 +123,36 @@ class OpenRouterDocumentExtractor:
             )
         if ExtractionType.BalanceSheet in requested_types:
             task_lines.append("- Extract balance sheet values as line items.")
+        if ExtractionType.Metadata in requested_types:
+            task_lines.append(
+                "- Extract report metadata with trust_name, company_registration_number, "
+                "financial_year_ending, and accounting_officer."
+            )
+        if ExtractionType.Governance in requested_types:
+            task_lines.append(
+                "- Extract governance trustees with name, meetings_attended, and "
+                "meetings_possible."
+            )
+        if ExtractionType.StatementOfFinancialActivities in requested_types:
+            task_lines.append(
+                "- Extract statement_of_financial_activities with income and expenditure "
+                "fund breakdown rows."
+            )
+        if ExtractionType.DetailedBalanceSheet in requested_types:
+            task_lines.append(
+                "- Extract detailed_balance_sheet with fixed_assets, current_assets, "
+                "liabilities, and net_assets."
+            )
+        if ExtractionType.StaffingData in requested_types:
+            task_lines.append(
+                "- Extract staffing_data with average_headcount_fte, total_staff_costs, "
+                "and high_pay_bands."
+            )
+        if ExtractionType.AcademyTrustAnnualReport in requested_types:
+            task_lines.append(
+                "- Extract academy_trust_annual_report with metadata, governance, "
+                "statement_of_financial_activities, balance_sheet, and staffing_data."
+            )
 
         system_prompt = (
             "You extract structured data from UK company filing documents. "
@@ -134,6 +170,8 @@ class OpenRouterDocumentExtractor:
             "present and non-empty.\n"
             "For optional fields like period and currency, use null when the value "
             "is missing.\n"
+            "For academy trust report sections, use null or omit optional fields when "
+            "the filing does not provide a value.\n"
             "Never use empty-string placeholders for missing values."
         )
         return system_prompt, user_prompt
@@ -243,6 +281,36 @@ class OpenRouterDocumentExtractor:
             }
             required.append("balance_sheet")
 
+        if ExtractionType.Metadata in requested_types:
+            properties["metadata"] = OpenRouterDocumentExtractor._schema_for_metadata()
+            required.append("metadata")
+
+        if ExtractionType.Governance in requested_types:
+            properties["governance"] = OpenRouterDocumentExtractor._schema_for_governance()
+            required.append("governance")
+
+        if ExtractionType.StatementOfFinancialActivities in requested_types:
+            properties[
+                "statement_of_financial_activities"
+            ] = OpenRouterDocumentExtractor._schema_for_statement_of_financial_activities()
+            required.append("statement_of_financial_activities")
+
+        if ExtractionType.DetailedBalanceSheet in requested_types:
+            properties[
+                "detailed_balance_sheet"
+            ] = OpenRouterDocumentExtractor._schema_for_detailed_balance_sheet()
+            required.append("detailed_balance_sheet")
+
+        if ExtractionType.StaffingData in requested_types:
+            properties["staffing_data"] = OpenRouterDocumentExtractor._schema_for_staffing_data()
+            required.append("staffing_data")
+
+        if ExtractionType.AcademyTrustAnnualReport in requested_types:
+            properties[
+                "academy_trust_annual_report"
+            ] = OpenRouterDocumentExtractor._schema_for_academy_trust_annual_report()
+            required.append("academy_trust_annual_report")
+
         return {
             "type": "json_schema",
             "json_schema": {
@@ -255,6 +323,187 @@ class OpenRouterDocumentExtractor:
                     "additionalProperties": False,
                 },
             },
+        }
+
+    @staticmethod
+    def _schema_for_fund_breakdown() -> dict[str, Any]:
+        return {
+            "type": "object",
+            "properties": {
+                "unrestricted_funds": {"type": ["number", "null"]},
+                "restricted_general_funds": {"type": ["number", "null"]},
+                "restricted_fixed_asset_funds": {"type": ["number", "null"]},
+                "total": {"type": ["number", "null"]},
+            },
+            "additionalProperties": False,
+        }
+
+    @staticmethod
+    def _schema_for_metadata() -> dict[str, Any]:
+        return {
+            "type": "object",
+            "properties": {
+                "trust_name": {"type": "string"},
+                "company_registration_number": {
+                    "type": "string",
+                    "pattern": "^[0-9]{8}$",
+                },
+                "financial_year_ending": {"type": "string", "format": "date"},
+                "accounting_officer": {"type": ["string", "null"]},
+            },
+            "required": [
+                "trust_name",
+                "company_registration_number",
+                "financial_year_ending",
+                "accounting_officer",
+            ],
+            "additionalProperties": False,
+        }
+
+    @staticmethod
+    def _schema_for_governance() -> dict[str, Any]:
+        return {
+            "type": "object",
+            "properties": {
+                "trustees": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "name": {"type": ["string", "null"]},
+                            "meetings_attended": {"type": ["integer", "null"]},
+                            "meetings_possible": {"type": ["integer", "null"]},
+                        },
+                        "required": ["name", "meetings_attended", "meetings_possible"],
+                        "additionalProperties": False,
+                    },
+                }
+            },
+            "required": ["trustees"],
+            "additionalProperties": False,
+        }
+
+    @staticmethod
+    def _schema_for_statement_of_financial_activities() -> dict[str, Any]:
+        fund_breakdown = OpenRouterDocumentExtractor._schema_for_fund_breakdown()
+        return {
+            "type": "object",
+            "properties": {
+                "income": {
+                    "type": "object",
+                    "properties": {
+                        "donations_and_capital_grants": {
+                            "anyOf": [fund_breakdown, {"type": "null"}]
+                        },
+                        "charitable_activities_education": {
+                            "anyOf": [fund_breakdown, {"type": "null"}]
+                        },
+                        "other_trading_activities": {
+                            "anyOf": [fund_breakdown, {"type": "null"}]
+                        },
+                        "investments": {"anyOf": [fund_breakdown, {"type": "null"}]},
+                    },
+                    "required": [
+                        "donations_and_capital_grants",
+                        "charitable_activities_education",
+                        "other_trading_activities",
+                        "investments",
+                    ],
+                    "additionalProperties": False,
+                },
+                "expenditure": {
+                    "type": "object",
+                    "properties": {
+                        "charitable_activities_education": {
+                            "anyOf": [fund_breakdown, {"type": "null"}]
+                        }
+                    },
+                    "required": ["charitable_activities_education"],
+                    "additionalProperties": False,
+                },
+            },
+            "required": ["income", "expenditure"],
+            "additionalProperties": False,
+        }
+
+    @staticmethod
+    def _schema_for_detailed_balance_sheet() -> dict[str, Any]:
+        return {
+            "type": "object",
+            "properties": {
+                "fixed_assets": {"type": ["number", "null"]},
+                "current_assets": {
+                    "type": "object",
+                    "properties": {
+                        "debtors": {"type": ["number", "null"]},
+                        "cash_at_bank": {"type": ["number", "null"]},
+                    },
+                    "required": ["debtors", "cash_at_bank"],
+                    "additionalProperties": False,
+                },
+                "liabilities": {
+                    "type": "object",
+                    "properties": {
+                        "creditors_within_one_year": {"type": ["number", "null"]},
+                        "pension_scheme_liability": {"type": ["number", "null"]},
+                    },
+                    "required": [
+                        "creditors_within_one_year",
+                        "pension_scheme_liability",
+                    ],
+                    "additionalProperties": False,
+                },
+                "net_assets": {"type": ["number", "null"]},
+            },
+            "required": ["fixed_assets", "current_assets", "liabilities", "net_assets"],
+            "additionalProperties": False,
+        }
+
+    @staticmethod
+    def _schema_for_staffing_data() -> dict[str, Any]:
+        return {
+            "type": "object",
+            "properties": {
+                "average_headcount_fte": {"type": ["number", "null"]},
+                "total_staff_costs": {"type": ["number", "null"]},
+                "high_pay_bands": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "band_range": {"type": ["string", "null"]},
+                            "count": {"type": ["integer", "null"]},
+                        },
+                        "required": ["band_range", "count"],
+                        "additionalProperties": False,
+                    },
+                },
+            },
+            "required": ["average_headcount_fte", "total_staff_costs", "high_pay_bands"],
+            "additionalProperties": False,
+        }
+
+    @staticmethod
+    def _schema_for_academy_trust_annual_report() -> dict[str, Any]:
+        return {
+            "type": "object",
+            "properties": {
+                "metadata": OpenRouterDocumentExtractor._schema_for_metadata(),
+                "governance": OpenRouterDocumentExtractor._schema_for_governance(),
+                "statement_of_financial_activities": (
+                    OpenRouterDocumentExtractor._schema_for_statement_of_financial_activities()
+                ),
+                "balance_sheet": OpenRouterDocumentExtractor._schema_for_detailed_balance_sheet(),
+                "staffing_data": OpenRouterDocumentExtractor._schema_for_staffing_data(),
+            },
+            "required": [
+                "metadata",
+                "governance",
+                "statement_of_financial_activities",
+                "balance_sheet",
+                "staffing_data",
+            ],
+            "additionalProperties": False,
         }
 
     @staticmethod
@@ -382,6 +631,13 @@ class OpenRouterDocumentExtractor:
     ) -> ExtractionResult:
         personnel_details: list[PersonnelDetail] | None = None
         balance_sheet: list[BalanceSheetEntry] | None = None
+        metadata: Metadata | None = None
+        governance: Governance | None = None
+        statement_of_financial_activities: StatementOfFinancialActivities | None = None
+        detailed_balance_sheet: DetailedBalanceSheet | None = None
+        staffing_data: StaffingData | None = None
+        academy_trust_annual_report: AcademyTrustAnnualReport | None = None
+        validation_warnings: list[str] = []
 
         if ExtractionType.PersonnelDetails in requested_types:
             raw_personnel = payload.get("personnel_details", [])
@@ -391,6 +647,42 @@ class OpenRouterDocumentExtractor:
             raw_balance = payload.get("balance_sheet", [])
             balance_sheet = self._parse_balance_sheet(raw_balance)
 
+        if ExtractionType.Metadata in requested_types:
+            raw_metadata = payload.get("metadata")
+            metadata = self._parse_metadata(raw_metadata)
+
+        if ExtractionType.Governance in requested_types:
+            raw_governance = payload.get("governance")
+            governance = self._parse_governance(raw_governance)
+
+        if ExtractionType.StatementOfFinancialActivities in requested_types:
+            raw_sofa = payload.get("statement_of_financial_activities")
+            statement_of_financial_activities = self._parse_statement_of_financial_activities(
+                raw_sofa
+            )
+
+        if ExtractionType.DetailedBalanceSheet in requested_types:
+            raw_detailed_balance_sheet = payload.get("detailed_balance_sheet")
+            detailed_balance_sheet = self._parse_detailed_balance_sheet(
+                raw_detailed_balance_sheet
+            )
+
+        if ExtractionType.StaffingData in requested_types:
+            raw_staffing_data = payload.get("staffing_data")
+            staffing_data = self._parse_staffing_data(raw_staffing_data)
+
+        if ExtractionType.AcademyTrustAnnualReport in requested_types:
+            raw_annual_report = payload.get("academy_trust_annual_report")
+            academy_trust_annual_report = self._parse_academy_trust_annual_report(
+                raw_annual_report
+            )
+
+        validation_warnings = self._collect_validation_warnings(
+            statement_of_financial_activities=statement_of_financial_activities,
+            detailed_balance_sheet=detailed_balance_sheet,
+            academy_trust_annual_report=academy_trust_annual_report,
+        )
+
         try:
             return ExtractionResult(
                 source_path=document_path,
@@ -398,9 +690,148 @@ class OpenRouterDocumentExtractor:
                 requested_types=requested_types,
                 personnel_details=personnel_details,
                 balance_sheet=balance_sheet,
+                metadata=metadata,
+                governance=governance,
+                statement_of_financial_activities=statement_of_financial_activities,
+                detailed_balance_sheet=detailed_balance_sheet,
+                staffing_data=staffing_data,
+                academy_trust_annual_report=academy_trust_annual_report,
+                validation_warnings=validation_warnings,
             )
         except ValidationError as exc:
             raise DocumentExtractionError(f"Invalid extraction result: {exc}") from exc
+
+    @staticmethod
+    def _collect_validation_warnings(
+        statement_of_financial_activities: StatementOfFinancialActivities | None,
+        detailed_balance_sheet: DetailedBalanceSheet | None,
+        academy_trust_annual_report: AcademyTrustAnnualReport | None,
+    ) -> list[str]:
+        warnings: list[str] = []
+
+        if statement_of_financial_activities is not None:
+            warnings.extend(
+                OpenRouterDocumentExtractor._reconcile_sofa(
+                    statement_of_financial_activities, prefix="statement_of_financial_activities"
+                )
+            )
+        if detailed_balance_sheet is not None:
+            warnings.extend(
+                OpenRouterDocumentExtractor._reconcile_balance_sheet(
+                    detailed_balance_sheet, prefix="detailed_balance_sheet"
+                )
+            )
+        if academy_trust_annual_report is not None:
+            if academy_trust_annual_report.statement_of_financial_activities is not None:
+                warnings.extend(
+                    OpenRouterDocumentExtractor._reconcile_sofa(
+                        academy_trust_annual_report.statement_of_financial_activities,
+                        prefix="academy_trust_annual_report.statement_of_financial_activities",
+                    )
+                )
+            if academy_trust_annual_report.balance_sheet is not None:
+                warnings.extend(
+                    OpenRouterDocumentExtractor._reconcile_balance_sheet(
+                        academy_trust_annual_report.balance_sheet,
+                        prefix="academy_trust_annual_report.balance_sheet",
+                    )
+                )
+            if (
+                detailed_balance_sheet is not None
+                and academy_trust_annual_report.balance_sheet is not None
+                and detailed_balance_sheet.model_dump() != academy_trust_annual_report.balance_sheet.model_dump()
+            ):
+                warnings.append(
+                    "Detailed balance sheet differs between top-level `detailed_balance_sheet` "
+                    "and `academy_trust_annual_report.balance_sheet`."
+                )
+        return warnings
+
+    @staticmethod
+    def _reconcile_sofa(
+        statement_of_financial_activities: StatementOfFinancialActivities, prefix: str
+    ) -> list[str]:
+        warnings: list[str] = []
+        income = statement_of_financial_activities.income
+        expenditure = statement_of_financial_activities.expenditure
+        if income is not None:
+            warnings.extend(
+                OpenRouterDocumentExtractor._check_fund_breakdown(
+                    income.donations_and_capital_grants,
+                    f"{prefix}.income.donations_and_capital_grants",
+                )
+            )
+            warnings.extend(
+                OpenRouterDocumentExtractor._check_fund_breakdown(
+                    income.charitable_activities_education,
+                    f"{prefix}.income.charitable_activities_education",
+                )
+            )
+            warnings.extend(
+                OpenRouterDocumentExtractor._check_fund_breakdown(
+                    income.other_trading_activities,
+                    f"{prefix}.income.other_trading_activities",
+                )
+            )
+            warnings.extend(
+                OpenRouterDocumentExtractor._check_fund_breakdown(
+                    income.investments,
+                    f"{prefix}.income.investments",
+                )
+            )
+        if expenditure is not None:
+            warnings.extend(
+                OpenRouterDocumentExtractor._check_fund_breakdown(
+                    expenditure.charitable_activities_education,
+                    f"{prefix}.expenditure.charitable_activities_education",
+                )
+            )
+        return warnings
+
+    @staticmethod
+    def _check_fund_breakdown(fund_breakdown: Any, label: str) -> list[str]:
+        if fund_breakdown is None:
+            return []
+        unrestricted = fund_breakdown.unrestricted_funds
+        restricted_general = fund_breakdown.restricted_general_funds
+        restricted_fixed_asset = fund_breakdown.restricted_fixed_asset_funds
+        total = fund_breakdown.total
+        if None in (unrestricted, restricted_general, restricted_fixed_asset, total):
+            return []
+
+        components_sum = unrestricted + restricted_general + restricted_fixed_asset
+        if abs(components_sum - total) > 1:
+            return [
+                f"{label} total mismatch: component sum {components_sum} differs from total {total}."
+            ]
+        return []
+
+    @staticmethod
+    def _reconcile_balance_sheet(balance_sheet: DetailedBalanceSheet, prefix: str) -> list[str]:
+        if (
+            balance_sheet.fixed_assets is None
+            or balance_sheet.net_assets is None
+            or balance_sheet.current_assets is None
+            or balance_sheet.liabilities is None
+            or balance_sheet.current_assets.debtors is None
+            or balance_sheet.current_assets.cash_at_bank is None
+            or balance_sheet.liabilities.creditors_within_one_year is None
+            or balance_sheet.liabilities.pension_scheme_liability is None
+        ):
+            return []
+
+        computed_net_assets = (
+            balance_sheet.fixed_assets
+            + balance_sheet.current_assets.debtors
+            + balance_sheet.current_assets.cash_at_bank
+            - balance_sheet.liabilities.creditors_within_one_year
+            - balance_sheet.liabilities.pension_scheme_liability
+        )
+        if abs(computed_net_assets - balance_sheet.net_assets) > 1:
+            return [
+                f"{prefix} net_assets mismatch: computed {computed_net_assets} differs from reported {balance_sheet.net_assets}."
+            ]
+        return []
 
     @staticmethod
     def _parse_personnel_details(raw_personnel: Any) -> list[PersonnelDetail]:
@@ -429,6 +860,74 @@ class OpenRouterDocumentExtractor:
                     f"Invalid balance_sheet row at index {index}: {exc}"
                 ) from exc
         return balance_sheet
+
+    @staticmethod
+    def _parse_metadata(raw_metadata: Any) -> Metadata:
+        if not isinstance(raw_metadata, dict):
+            raise DocumentExtractionError("Expected `metadata` to be an object")
+        try:
+            return Metadata.model_validate(raw_metadata)
+        except ValidationError as exc:
+            raise DocumentExtractionError(f"Invalid metadata payload: {exc}") from exc
+
+    @staticmethod
+    def _parse_governance(raw_governance: Any) -> Governance:
+        if not isinstance(raw_governance, dict):
+            raise DocumentExtractionError("Expected `governance` to be an object")
+        try:
+            return Governance.model_validate(raw_governance)
+        except ValidationError as exc:
+            raise DocumentExtractionError(f"Invalid governance payload: {exc}") from exc
+
+    @staticmethod
+    def _parse_statement_of_financial_activities(
+        raw_sofa: Any,
+    ) -> StatementOfFinancialActivities:
+        if not isinstance(raw_sofa, dict):
+            raise DocumentExtractionError(
+                "Expected `statement_of_financial_activities` to be an object"
+            )
+        try:
+            return StatementOfFinancialActivities.model_validate(raw_sofa)
+        except ValidationError as exc:
+            raise DocumentExtractionError(
+                f"Invalid statement_of_financial_activities payload: {exc}"
+            ) from exc
+
+    @staticmethod
+    def _parse_detailed_balance_sheet(raw_balance_sheet: Any) -> DetailedBalanceSheet:
+        if not isinstance(raw_balance_sheet, dict):
+            raise DocumentExtractionError("Expected `detailed_balance_sheet` to be an object")
+        try:
+            return DetailedBalanceSheet.model_validate(raw_balance_sheet)
+        except ValidationError as exc:
+            raise DocumentExtractionError(
+                f"Invalid detailed_balance_sheet payload: {exc}"
+            ) from exc
+
+    @staticmethod
+    def _parse_staffing_data(raw_staffing_data: Any) -> StaffingData:
+        if not isinstance(raw_staffing_data, dict):
+            raise DocumentExtractionError("Expected `staffing_data` to be an object")
+        try:
+            return StaffingData.model_validate(raw_staffing_data)
+        except ValidationError as exc:
+            raise DocumentExtractionError(
+                f"Invalid staffing_data payload: {exc}"
+            ) from exc
+
+    @staticmethod
+    def _parse_academy_trust_annual_report(raw_annual_report: Any) -> AcademyTrustAnnualReport:
+        if not isinstance(raw_annual_report, dict):
+            raise DocumentExtractionError(
+                "Expected `academy_trust_annual_report` to be an object"
+            )
+        try:
+            return AcademyTrustAnnualReport.model_validate(raw_annual_report)
+        except ValidationError as exc:
+            raise DocumentExtractionError(
+                f"Invalid academy_trust_annual_report payload: {exc}"
+            ) from exc
 
     @staticmethod
     def _require_non_empty(value: str, name: str) -> None:

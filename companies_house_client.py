@@ -8,10 +8,16 @@ from urllib.parse import urlparse
 
 import requests
 from document_extraction_models import (
+    AcademyTrustAnnualReport,
     BalanceSheetEntry,
+    DetailedBalanceSheet,
     ExtractionResult,
     ExtractionType,
+    Governance,
+    Metadata,
     PersonnelDetail,
+    StaffingData,
+    StatementOfFinancialActivities,
 )
 from openrouter_document_extractor import DocumentExtractionError, OpenRouterDocumentExtractor
 
@@ -326,6 +332,24 @@ class CompaniesHouseClient:
             document_path=downloaded_path, extraction_types=extraction_types
         )
 
+    def extract_latest_mat_annual_report(
+        self,
+        company_number: str,
+        output_path: str,
+        extractor: "OpenRouterDocumentExtractor",
+        accept: str = "application/pdf",
+    ) -> "ExtractionResult":
+        """
+        Convenience flow for extracting a full MAT annual report payload.
+        """
+        return self.extract_latest_full_accounts(
+            company_number=company_number,
+            output_path=output_path,
+            extractor=extractor,
+            extraction_types=[ExtractionType.AcademyTrustAnnualReport],
+            accept=accept,
+        )
+
     def _request_json(
         self,
         method: str,
@@ -501,13 +525,19 @@ class CompaniesHouseClient:
 
 
 __all__ = [
+    "AcademyTrustAnnualReport",
     "BalanceSheetEntry",
     "CompaniesHouseApiError",
     "CompaniesHouseClient",
+    "DetailedBalanceSheet",
     "DocumentExtractionError",
     "ExtractionResult",
     "ExtractionType",
     "FilingDocumentType",
+    "Governance",
+    "Metadata",
     "OpenRouterDocumentExtractor",
     "PersonnelDetail",
+    "StaffingData",
+    "StatementOfFinancialActivities",
 ]
