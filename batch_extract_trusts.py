@@ -565,6 +565,12 @@ def build_parser() -> argparse.ArgumentParser:
         default="",
         help="Optional explicit path for summary JSON (defaults to <run_dir>/summary.json when enabled)",
     )
+    parser.add_argument(
+        "--retries-on-invalid-json",
+        type=int,
+        default=2,
+        help="Number of same-model retries when extraction output is malformed JSON (default 2)",
+    )
     return parser
 
 
@@ -590,6 +596,8 @@ def main() -> int:
         raise ValueError("ch_min_request_interval_seconds must be >= 0")
     if args.filing_history_items_per_page <= 0:
         raise ValueError("filing_history_items_per_page must be > 0")
+    if args.retries_on_invalid_json < 0:
+        raise ValueError("retries_on_invalid_json must be >= 0")
 
     output_root = Path(args.output_root)
     run_stamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
@@ -671,6 +679,11 @@ def main() -> int:
             run_id, args.filing_history_items_per_page
         )
     )
+    print(
+        "[run {}] retries_on_invalid_json={}".format(
+            run_id, args.retries_on_invalid_json
+        )
+    )
 
     client = CompaniesHouseClient(api_key=ch_api_key)
     throttle_state = _install_companies_house_request_throttle(
@@ -742,6 +755,7 @@ def main() -> int:
                 model_candidates=model_candidates,
                 document_path=downloaded_path,
                 extraction_types=extraction_types,
+                retries_on_invalid_json=args.retries_on_invalid_json,
             )
             stage = "extraction_ok"
 

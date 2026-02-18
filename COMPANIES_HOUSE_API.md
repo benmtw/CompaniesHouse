@@ -389,6 +389,7 @@ Useful controls:
 - `--write-summary-json` to emit run-level `summary.json` in the run folder
 - `--summary-json-path "<path>"` optional explicit location for summary JSON
 - `--filing-history-items-per-page 100` fetches only the first filing-history page for latest full-accounts selection (faster and lower request volume)
+- `--retries-on-invalid-json 0` to disable same-model retries on malformed LLM JSON for faster high-volume runs
 
 Per-run output layout:
 - `output\trusts_extraction\run_<UTCSTAMP>\<company_number>\documents\<company_number>_latest_full_accounts_<document_id>.pdf`
