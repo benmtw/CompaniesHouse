@@ -274,6 +274,63 @@ def _latest_full_accounts_document_id_from_filing_history(
     return CompaniesHouseClient._extract_document_id(metadata_url)
 
 
+def _extraction_types_for_schema_profile(schema_profile: str) -> list[ExtractionType]:
+    if schema_profile == "full_legacy":
+        return [
+            ExtractionType.PersonnelDetails,
+            ExtractionType.BalanceSheet,
+            ExtractionType.Metadata,
+            ExtractionType.Governance,
+            ExtractionType.StatementOfFinancialActivities,
+            ExtractionType.DetailedBalanceSheet,
+            ExtractionType.StaffingData,
+            ExtractionType.AcademyTrustAnnualReport,
+        ]
+    if schema_profile == "compact_single_call":
+        return [
+            ExtractionType.PersonnelDetails,
+            ExtractionType.BalanceSheet,
+            ExtractionType.Metadata,
+            ExtractionType.Governance,
+            ExtractionType.StatementOfFinancialActivities,
+            ExtractionType.DetailedBalanceSheet,
+            ExtractionType.StaffingData,
+        ]
+    if schema_profile == "light_core":
+        return [
+            ExtractionType.PersonnelDetails,
+            ExtractionType.BalanceSheet,
+            ExtractionType.Metadata,
+            ExtractionType.Governance,
+        ]
+    raise ValueError(f"Unsupported schema_profile: {schema_profile}")
+
+
+def _derive_annual_report_from_component_sections(
+    extraction_payload: dict[str, Any],
+) -> dict[str, Any] | None:
+    metadata = extraction_payload.get("metadata")
+    governance = extraction_payload.get("governance")
+    sofa = extraction_payload.get("statement_of_financial_activities")
+    balance_sheet = extraction_payload.get("detailed_balance_sheet")
+    staffing_data = extraction_payload.get("staffing_data")
+    if (
+        metadata is None
+        and governance is None
+        and sofa is None
+        and balance_sheet is None
+        and staffing_data is None
+    ):
+        return None
+    return {
+        "metadata": metadata,
+        "governance": governance,
+        "statement_of_financial_activities": sofa,
+        "balance_sheet": balance_sheet,
+        "staffing_data": staffing_data,
+    }
+
+
 def _extract_with_model_fallback(
     api_key: str,
     model_candidates: list[str],
@@ -571,6 +628,15 @@ def build_parser() -> argparse.ArgumentParser:
         default=2,
         help="Number of same-model retries when extraction output is malformed JSON (default 2)",
     )
+    parser.add_argument(
+        "--schema-profile",
+        choices=["compact_single_call", "full_legacy", "light_core"],
+        default=os.getenv("BATCH_SCHEMA_PROFILE", "compact_single_call"),
+        help=(
+            "Extraction schema profile. "
+            "compact_single_call minimizes nesting while keeping broad coverage."
+        ),
+    )
     return parser
 
 
@@ -609,16 +675,7 @@ def main() -> int:
     conn = sqlite3.connect(db_path)
     _create_tables(conn)
 
-    extraction_types = [
-        ExtractionType.PersonnelDetails,
-        ExtractionType.BalanceSheet,
-        ExtractionType.Metadata,
-        ExtractionType.Governance,
-        ExtractionType.StatementOfFinancialActivities,
-        ExtractionType.DetailedBalanceSheet,
-        ExtractionType.StaffingData,
-        ExtractionType.AcademyTrustAnnualReport,
-    ]
+    extraction_types = _extraction_types_for_schema_profile(args.schema_profile)
 
     run_id = _insert_run(
         conn=conn,
@@ -684,6 +741,7 @@ def main() -> int:
             run_id, args.retries_on_invalid_json
         )
     )
+    print("[run {}] schema_profile={}".format(run_id, args.schema_profile))
 
     client = CompaniesHouseClient(api_key=ch_api_key)
     throttle_state = _install_companies_house_request_throttle(
@@ -739,6 +797,7 @@ def main() -> int:
             if not document_id:
                 raise ValueError("No full accounts document found")
             stage = "latest_document_ok"
+            summary_row["document_id"] = document_id
 
             pdf_path = doc_dir / f"{company_number}_latest_full_accounts_{document_id}.pdf"
             downloaded_path = client.download_document(
@@ -749,6 +808,9 @@ def main() -> int:
             stage = "download_ok"
             pdf_size_bytes = Path(downloaded_path).stat().st_size
             approx_llm_tokens = _estimate_llm_tokens_for_pdf_bytes(pdf_size_bytes)
+            summary_row["pdf_path"] = str(pdf_path)
+            summary_row["pdf_size_bytes"] = pdf_size_bytes
+            summary_row["approx_llm_tokens"] = approx_llm_tokens
 
             extraction_payload, warnings_payload, model_used = _extract_with_model_fallback(
                 api_key=openrouter_api_key,
@@ -757,6 +819,13 @@ def main() -> int:
                 extraction_types=extraction_types,
                 retries_on_invalid_json=args.retries_on_invalid_json,
             )
+            if (
+                args.schema_profile == "compact_single_call"
+                and extraction_payload.get("academy_trust_annual_report") is None
+            ):
+                derived = _derive_annual_report_from_component_sections(extraction_payload)
+                if derived is not None:
+                    extraction_payload["academy_trust_annual_report"] = derived
             stage = "extraction_ok"
 
             profile_path = api_dir / "profile.json"
@@ -779,6 +848,7 @@ def main() -> int:
                 "approx_llm_tokens": approx_llm_tokens,
                 "model": args.model,
                 "model_used": model_used,
+                "schema_profile": args.schema_profile,
                 "requested_types": [t.value for t in extraction_types],
                 "extraction_result": extraction_payload,
             }
@@ -897,6 +967,7 @@ def main() -> int:
             "output_run_dir": str(output_run_dir),
             "model": args.model,
             "model_candidates": model_candidates,
+            "schema_profile": args.schema_profile,
             "requested_types": [t.value for t in extraction_types],
             "companies_house_min_request_interval_seconds": args.ch_min_request_interval_seconds,
             "estimated_companies_house_rate_requests_per_second": (

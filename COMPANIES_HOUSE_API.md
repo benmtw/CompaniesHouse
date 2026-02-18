@@ -390,6 +390,7 @@ Useful controls:
 - `--summary-json-path "<path>"` optional explicit location for summary JSON
 - `--filing-history-items-per-page 100` fetches only the first filing-history page for latest full-accounts selection (faster and lower request volume)
 - `--retries-on-invalid-json 0` to disable same-model retries on malformed LLM JSON for faster high-volume runs
+- `--schema-profile compact_single_call` (default) reduces schema nesting by removing duplicate deep annual-report branch from the request; `full_legacy` keeps prior full schema; `light_core` requests only lightweight sections
 
 Per-run output layout:
 - `output\trusts_extraction\run_<UTCSTAMP>\<company_number>\documents\<company_number>_latest_full_accounts_<document_id>.pdf`
