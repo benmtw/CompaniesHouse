@@ -95,6 +95,7 @@ Implementation implications:
 - Use retry/backoff only for transient failures; do not aggressively retry `429`.
 - Respect `429` as a quota signal and delay until the next window.
 - Keep concurrency bounded in batch jobs.
+- Current client defaults: `max_retries_on_429=3`, `retry_backoff_seconds=10`, `respect_retry_after=True`.
 
 ## 4) Quick Workflow (Most Common)
 
@@ -239,6 +240,7 @@ Invoke-RestMethod -Method GET `
 Scripts already created in this repo:
 - `companieshouse_fetch.ps1` (end-to-end workflow)
 - `run_companieshouse.bat` (wrapper)
+- `batch_extract_trusts.py` (batch XLSX -> PDF + JSON + SQLite extraction pipeline)
 
 Core Python modules:
 - `companies_house_client.py` (Companies House API client + compatibility exports)
@@ -270,8 +272,8 @@ The client now includes an OpenRouter-backed extractor for downloaded filings.
 Required env variables:
 - `CH_API_KEY`
 - `OPENROUTER_API_KEY`
-- Optional: `OPENROUTER_MODEL` (or pass model in code)
-- Cost warning: `openrouter/auto` can route to expensive providers/models. Set a specific budget-friendly model in `OPENROUTER_MODEL` for production runs.
+- `OPENROUTER_MODEL` (or pass model in code)
+- Cost warning: avoid `openrouter/auto` for production/cost control; set an explicit model in `OPENROUTER_MODEL`.
 
 Current extraction behavior:
 - `extract_latest_full_accounts(...)` selects the latest `FilingDocumentType.FULL_ACCOUNTS` document only for retrieval.
@@ -291,6 +293,9 @@ Current extraction behavior:
 - No local PDF parsing/text extraction is performed in this project.
 - OpenRouter structured output is enforced with `response_format.type = "json_schema"` and strict schema mode.
 - OpenRouter provider preferences set `require_parameters = false` for model-specific compatibility and lower-friction routing.
+- JSON parsing strategy is strict-first, then repair fallback:
+  - First attempt: `json.loads(...)`
+  - Fallback: `json-repair` (`json_repair.loads(..., skip_json_loads=True)`) for malformed but recoverable JSON emitted by models
 - `ExtractionResult.validation_warnings` contains non-fatal reconciliation warnings. Extraction continues even when warnings are present.
 - Reconciliation warning checks currently include:
   - SOFA fund component sums vs reported `total`.
@@ -312,7 +317,7 @@ from companies_house_client import (
 client = CompaniesHouseClient(api_key=os.getenv("CH_API_KEY"))
 extractor = OpenRouterDocumentExtractor(
     api_key=os.getenv("OPENROUTER_API_KEY"),
-    model=os.getenv("OPENROUTER_MODEL", "openai/gpt-4o-mini"),
+    model=os.getenv("OPENROUTER_MODEL"),
 )
 
 result = client.extract_latest_full_accounts(
@@ -340,7 +345,7 @@ from companies_house_client import CompaniesHouseClient, OpenRouterDocumentExtra
 client = CompaniesHouseClient(api_key=os.getenv("CH_API_KEY"))
 extractor = OpenRouterDocumentExtractor(
     api_key=os.getenv("OPENROUTER_API_KEY"),
-    model=os.getenv("OPENROUTER_MODEL", "openai/gpt-4o-mini"),
+    model=os.getenv("OPENROUTER_MODEL"),
 )
 
 result = client.extract_latest_mat_annual_report(
@@ -355,7 +360,51 @@ print("MAT report keys:", list(report.model_dump().keys()) if report else [])
 '@ | .\.venv\Scripts\python -
 ```
 
-## 12) Smoke Test And Final Validation
+## 12) Batch Trust Extraction Pipeline
+
+Purpose:
+- Read `SourceData\allgroupslinksdata20260217\Trusts.xlsx`
+- Use `Companies House Number` as the canonical identifier
+- Download latest full-accounts PDF per trust
+- Extract all available structured fields via OpenRouter
+- Save outputs as files and in SQLite
+
+PowerShell run example:
+
+```powershell
+.\.venv\Scripts\python .\batch_extract_trusts.py `
+  --input-xlsx "SourceData\allgroupslinksdata20260217\Trusts.xlsx" `
+  --output-root "output\trusts_extraction" `
+  --model "google/gemini-2.5-flash-lite"
+```
+
+Useful controls:
+- `--max-companies 10` to run a small sample first
+- `--start-index 100` to resume from an offset in the deduplicated list
+- `--db-path "output\trusts_extraction\companies_house_extractions.db"` to override DB location
+- `--random-sample-size 10` to process a random sample from the selected batch
+- `--random-seed 42` to make random sampling reproducible
+- `--fallback-models "<modelA>,<modelB>"` optional fallback list when a provider rejects file message content for your primary model
+- `--ch-min-request-interval-seconds 2.0` minimum delay between Companies House HTTP requests (default is `2.0`, which is ~25% of the documented `600/5min` limit). Set `0` to disable pacing.
+- `--write-summary-json` to emit run-level `summary.json` in the run folder
+- `--summary-json-path "<path>"` optional explicit location for summary JSON
+
+Per-run output layout:
+- `output\trusts_extraction\run_<UTCSTAMP>\<company_number>\documents\<company_number>_latest_full_accounts_<document_id>.pdf`
+- `output\trusts_extraction\run_<UTCSTAMP>\<company_number>\api\profile.json`
+- `output\trusts_extraction\run_<UTCSTAMP>\<company_number>\api\filing_history.json`
+- `output\trusts_extraction\run_<UTCSTAMP>\<company_number>\extraction\extraction_result.json`
+- `output\trusts_extraction\run_<UTCSTAMP>\<company_number>\extraction\validation_warnings.json`
+- `output\trusts_extraction\run_<UTCSTAMP>\<company_number>\extraction\run_report.json`
+- Optional run summary: `output\trusts_extraction\run_<UTCSTAMP>\summary.json` (when `--write-summary-json` is set)
+
+SQLite persistence:
+- Default DB path: `output\trusts_extraction\companies_house_extractions.db`
+- Table `runs`: one row per batch run with counters and model metadata
+- Table `company_reports`: one row per company with status, document id, file paths, `model_used`, `pdf_size_bytes`, `approx_llm_tokens`, error text, and JSON payloads (`profile_json`, `filing_history_json`, `extraction_json`, `warnings_json`)
+- Batch extractor behavior: retries the same model up to 3 attempts total when OpenRouter returns non-JSON content, to reduce transient parse failures.
+
+## 13) Smoke Test And Final Validation
 
 Unit test command:
 
@@ -371,7 +420,7 @@ Expected baseline:
 Live smoke guidance:
 1. Set `CH_API_KEY` in `.env`.
 2. Set `OPENROUTER_API_KEY` in `.env` for extraction smoke.
-3. Set a specific low-cost model in `.env` (example: `OPENROUTER_MODEL=openai/gpt-4o-mini`).
+3. Set an explicit model in `.env` (example: `OPENROUTER_MODEL=google/gemini-2.5-flash-lite`).
 4. Re-run `.\.venv\Scripts\python -m unittest -v test_companies_house_client.py`.
 
 Known limitations:
