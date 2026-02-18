@@ -277,7 +277,7 @@ Current extraction behavior:
 - `extract_latest_full_accounts(...)` selects the latest `FilingDocumentType.FULL_ACCOUNTS` document only for retrieval.
 - Extraction itself is requested independently via `ExtractionType`:
   - `ExtractionType.PersonnelDetails` -> `first_name`, `last_name`, `job_title`
-  - `ExtractionType.BalanceSheet` -> `line_item`, `value`, optional `period`, optional `currency`
+  - `ExtractionType.BalanceSheet` -> `line_item`, `value`, nullable `period`, nullable `currency`
 - The extractor sends the downloaded document file directly to OpenRouter chat completions as message content `type: "file"` with `file.file_data` data URI.
 - No local PDF parsing/text extraction is performed in this project.
 - OpenRouter structured output is enforced with `response_format.type = "json_schema"` and strict schema mode.

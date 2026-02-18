@@ -52,3 +52,4 @@ Expected usage:
 - Treat `OPENROUTER_MODEL=openrouter/auto` as high-cost mode. Prefer explicitly configured lower-cost models unless the user explicitly requests auto-routing.
 - Use Windows PowerShell-compatible commands in docs/examples.
 - When looking up information on third-party libraries, query the `context7` MCP server first before attempting web search.
+- For live API/integration runs in Codex, request escalated execution (outside sandbox) and run commands directly with `.\.venv\Scripts\python`.

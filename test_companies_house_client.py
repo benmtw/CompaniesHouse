@@ -523,6 +523,97 @@ class CompaniesHouseLiveSmokeTest(unittest.TestCase):
         self.assertGreater(len(docs), 0)
         self.assertIn("document_id", docs[0])
 
+    def test_live_full_report_for_9253218_and_extract_content_names(self):
+        api_key = os.getenv("CH_API_KEY")
+        if not api_key:
+            self.skipTest("CH_API_KEY not set; skipping live smoke test")
+        openrouter_api_key = os.getenv("OPENROUTER_API_KEY")
+        if not openrouter_api_key:
+            self.skipTest(
+                "OPENROUTER_API_KEY not set; skipping live extraction in smoke test"
+            )
+
+        raw_company_number = "9253218"
+        company_number = raw_company_number.zfill(8)
+        client = CompaniesHouseClient(api_key=api_key)
+
+        profile = client.get_company_profile(company_number)
+        filing_history = client.get_all_filing_history(company_number=company_number)
+
+        content_names = sorted(
+            {
+                str(item.get("description")).strip()
+                for item in filing_history
+                if item.get("description")
+            }
+        )
+
+        full_report = {
+            "company_number": company_number,
+            "company_name": profile.get("company_name"),
+            "company_profile": profile,
+            "filing_history_count": len(filing_history),
+            "filing_history": filing_history,
+            "content_names": content_names,
+        }
+
+        latest_full_accounts = client.get_latest_document(
+            company_number=company_number,
+            document_type=FilingDocumentType.FULL_ACCOUNTS,
+        )
+        self.assertIsNotNone(latest_full_accounts)
+        document_id = str((latest_full_accounts or {}).get("document_id") or "").strip()
+        self.assertTrue(document_id)
+
+        output_dir = os.path.join("SourceData", "_tmp_live_tests")
+        os.makedirs(output_dir, exist_ok=True)
+        output_path = os.path.join(output_dir, f"{company_number}_latest_full_accounts.pdf")
+        downloaded_path = client.download_document(
+            document_id=document_id,
+            output_path=output_path,
+            accept="application/pdf",
+        )
+        extractor = OpenRouterDocumentExtractor(
+            api_key=openrouter_api_key,
+            model=os.getenv("OPENROUTER_MODEL", "openai/gpt-4o-mini"),
+        )
+        extraction = extractor.extract(
+            document_path=downloaded_path,
+            extraction_types=[
+                ExtractionType.PersonnelDetails,
+                ExtractionType.BalanceSheet,
+            ],
+        )
+
+        print(f"\nFull report company_number: {company_number}")
+        print(f"Full report company_name: {profile.get('company_name')}")
+        print(f"Content names ({len(content_names)}):")
+        for name in content_names:
+            print(f"- {name}")
+
+        personnel_rows = extraction.personnel_details or []
+        print(f"Personnel findings ({len(personnel_rows)}):")
+        if not personnel_rows:
+            print("- none")
+        for row in personnel_rows:
+            print(f"- {row.first_name} {row.last_name}: {row.job_title}")
+
+        balance_rows = extraction.balance_sheet or []
+        print(f"Balance sheet findings ({len(balance_rows)}):")
+        if not balance_rows:
+            print("- none")
+        for row in balance_rows:
+            period = f" | period={row.period}" if row.period else ""
+            currency = f" | currency={row.currency}" if row.currency else ""
+            print(f"- {row.line_item}: {row.value}{period}{currency}")
+
+        self.assertEqual(str(profile.get("company_number")), company_number)
+        self.assertGreater(full_report["filing_history_count"], 0)
+        self.assertIsInstance(full_report["content_names"], list)
+        self.assertTrue(all(isinstance(name, str) for name in full_report["content_names"]))
+        self.assertIsNotNone(extraction.personnel_details)
+        self.assertIsNotNone(extraction.balance_sheet)
+
 
 if __name__ == "__main__":
     unittest.main()

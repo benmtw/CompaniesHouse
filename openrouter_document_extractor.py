@@ -132,8 +132,8 @@ class OpenRouterDocumentExtractor:
             "are all present and non-empty.\n"
             "Do not emit a balance_sheet row unless line_item and value are both "
             "present and non-empty.\n"
-            "For optional fields like period and currency, omit the field when the "
-            "value is missing.\n"
+            "For optional fields like period and currency, use null when the value "
+            "is missing.\n"
             "Never use empty-string placeholders for missing values."
         )
         return system_prompt, user_prompt
@@ -229,15 +229,15 @@ class OpenRouterDocumentExtractor:
                             "description": "Extracted value for the line item.",
                         },
                         "period": {
-                            "type": "string",
+                            "type": ["string", "null"],
                             "description": "Period/date context for the value.",
                         },
                         "currency": {
-                            "type": "string",
+                            "type": ["string", "null"],
                             "description": "Currency code/symbol if present.",
                         },
                     },
-                    "required": ["line_item", "value"],
+                    "required": ["line_item", "value", "period", "currency"],
                     "additionalProperties": False,
                 },
             }
