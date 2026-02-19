@@ -1,11 +1,29 @@
 import base64
 import json
 import os
+import queue
+import sqlite3
 import tempfile
+import threading
+import time
 import unittest
 from pathlib import Path
 from unittest.mock import Mock, patch
 
+from companies_house_full_reports_extraction_pipeline import (
+    GlobalCHThrottle,
+    _create_tables,
+    _enqueue_with_backpressure,
+    _insert_job,
+    _insert_run,
+    _install_global_throttle_on_client,
+    _parse_company_numbers_csv,
+    _update_download_state,
+    _update_extract_state,
+    _update_final_state,
+    _validate_input_xor,
+    _validate_worker_settings,
+)
 from companies_house_client import (
     AcademyTrustAnnualReport,
     CompaniesHouseApiError,
@@ -1113,6 +1131,125 @@ class OpenRouterDocumentExtractorTests(unittest.TestCase):
         self.assertEqual(out["personnel_details"], [])
         self.assertEqual(out["balance_sheet"], [])
         mocked.assert_called()
+
+
+class FullReportsExtractionPipelineTests(unittest.TestCase):
+    def test_parse_company_numbers_csv_normalizes_and_dedupes(self):
+        parsed = _parse_company_numbers_csv(" 9618502,09618502, ABC, 08496504 ,")
+        self.assertEqual(parsed, ["09618502", "08496504"])
+
+    def test_validate_input_xor_rejects_both_and_neither(self):
+        with self.assertRaises(ValueError):
+            _validate_input_xor("", "")
+        with self.assertRaises(ValueError):
+            _validate_input_xor("Trusts.xlsx", "09618502")
+        _validate_input_xor("Trusts.xlsx", "")
+        _validate_input_xor("", "09618502")
+
+    def test_validate_worker_settings_rejects_invalid_values(self):
+        with self.assertRaises(ValueError):
+            _validate_worker_settings(0, 1, 1)
+        with self.assertRaises(ValueError):
+            _validate_worker_settings(1, 0, 1)
+        with self.assertRaises(ValueError):
+            _validate_worker_settings(1, 1, 0)
+        _validate_worker_settings(1, 1, 1)
+
+    def test_shared_throttle_enforces_global_spacing_and_count(self):
+        client = CompaniesHouseClient(api_key="k")
+        client.session.request = Mock(return_value=DummyResponse())
+        throttle = GlobalCHThrottle(min_interval_seconds=0.05, lock=threading.Lock())
+        _install_global_throttle_on_client(client, throttle)
+
+        started = time.monotonic()
+        client.session.request("GET", "https://example.test/1")
+        client.session.request("GET", "https://example.test/2")
+        elapsed = time.monotonic() - started
+
+        self.assertGreaterEqual(elapsed, 0.04)
+        self.assertEqual(throttle.request_count, 2)
+
+    def test_bounded_queue_backpressure(self):
+        work_queue: queue.Queue[object] = queue.Queue(maxsize=1)
+        work_queue.put({"job": 1})
+        shutdown = threading.Event()
+        pushed = threading.Event()
+
+        def producer() -> None:
+            ok = _enqueue_with_backpressure(work_queue, {"job": 2}, shutdown, timeout_seconds=0.01)
+            if ok:
+                pushed.set()
+
+        thread = threading.Thread(target=producer)
+        thread.start()
+        time.sleep(0.05)
+        self.assertFalse(pushed.is_set())
+        self.assertEqual(work_queue.get()["job"], 1)
+        thread.join(timeout=1.0)
+        self.assertTrue(pushed.is_set())
+        self.assertEqual(work_queue.get()["job"], 2)
+
+    def test_job_state_transitions_persist_terminal_states(self):
+        conn = sqlite3.connect(":memory:")
+        _create_tables(conn)
+        run_id = _insert_run(
+            conn,
+            {
+                "mode": "all",
+                "input_source_type": "company_numbers",
+                "input_source_value": "09618502",
+                "output_run_dir": "output/run_test",
+                "model": "m",
+                "fallback_models_json": "[]",
+                "schema_profile": "compact_single_call",
+                "ch_workers": 2,
+                "or_workers": 4,
+                "max_pending_extractions": 10,
+                "ch_min_request_interval_seconds": 0.0,
+                "filing_history_items_per_page": 100,
+                "retries_on_invalid_json": 2,
+                "openrouter_timeout_seconds": 180.0,
+                "total_jobs": 1,
+            },
+        )
+        _insert_job(
+            conn,
+            {
+                "run_id": run_id,
+                "job_index": 1,
+                "company_number": "09618502",
+                "download_status": "pending",
+                "extract_status": "pending",
+                "final_status": "pending",
+            },
+        )
+        _update_download_state(conn, run_id, 1, "running", {"download_attempts": 1})
+        _update_download_state(
+            conn,
+            run_id,
+            1,
+            "success",
+            {"document_id": "doc-1", "pdf_path": "a.pdf", "download_error": None},
+        )
+        _update_extract_state(conn, run_id, 1, "running", {"extract_attempts": 1})
+        _update_extract_state(conn, run_id, 1, "failed", {"extract_error": "bad json"})
+        _update_final_state(conn, run_id, 1, "failed", "bad json")
+
+        row = conn.execute(
+            """
+            SELECT download_status, extract_status, final_status, document_id, extract_error, final_error
+            FROM pipeline_jobs
+            WHERE run_id = ? AND job_index = 1
+            """,
+            (run_id,),
+        ).fetchone()
+        self.assertEqual(row[0], "success")
+        self.assertEqual(row[1], "failed")
+        self.assertEqual(row[2], "failed")
+        self.assertEqual(row[3], "doc-1")
+        self.assertEqual(row[4], "bad json")
+        self.assertEqual(row[5], "bad json")
+        conn.close()
 
 
 class CompaniesHouseLiveSmokeTest(unittest.TestCase):
