@@ -7,7 +7,7 @@ import sqlite3
 import time
 import traceback
 import xml.etree.ElementTree as ET
-from datetime import UTC, datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 from zipfile import ZipFile
@@ -179,7 +179,7 @@ def write_json(path: Path, payload: Any) -> None:
 
 
 def _utc_now() -> str:
-    return datetime.now(UTC).replace(microsecond=0).isoformat()
+    return datetime.now(timezone.utc).replace(microsecond=0).isoformat()
 
 
 def _parse_fallback_models(raw_models: str) -> list[str]:
@@ -205,6 +205,14 @@ def _is_file_not_supported_error(exc: Exception) -> bool:
 
 def _is_invalid_json_error(exc: Exception) -> bool:
     return "response was not valid json" in str(exc).lower()
+
+
+def _is_schema_depth_error(exc: Exception) -> bool:
+    message = str(exc).lower()
+    return (
+        "maximum allowed nesting depth" in message
+        or "schema in generationconfig" in message
+    )
 
 
 def _install_companies_house_request_throttle(
@@ -363,6 +371,48 @@ def _extract_with_model_fallback(
             + " | ".join(errors)
         )
     raise DocumentExtractionError("No models configured for extraction")
+
+
+def _extract_with_adaptive_schema_fallback(
+    api_key: str,
+    model_candidates: list[str],
+    document_path: str,
+    schema_profile: str,
+    retries_on_invalid_json: int = 2,
+) -> tuple[dict[str, Any], list[str], str, str, list[str]]:
+    profile_attempts = [schema_profile]
+    if schema_profile == "compact_single_call":
+        profile_attempts.append("light_core")
+
+    profile_errors: list[str] = []
+    for attempt_profile in profile_attempts:
+        extraction_types = _extraction_types_for_schema_profile(attempt_profile)
+        try:
+            extraction_payload, warnings_payload, model_used = _extract_with_model_fallback(
+                api_key=api_key,
+                model_candidates=model_candidates,
+                document_path=document_path,
+                extraction_types=extraction_types,
+                retries_on_invalid_json=retries_on_invalid_json,
+            )
+            return (
+                extraction_payload,
+                warnings_payload,
+                model_used,
+                attempt_profile,
+                [e for e in profile_errors],
+            )
+        except DocumentExtractionError as exc:
+            is_last_profile = attempt_profile == profile_attempts[-1]
+            if not _is_schema_depth_error(exc) or is_last_profile:
+                if profile_errors:
+                    raise DocumentExtractionError(
+                        f"{exc} | adaptive profile attempts: {' | '.join(profile_errors)}"
+                    ) from exc
+                raise
+            profile_errors.append(f"{attempt_profile}: {exc}")
+
+    raise DocumentExtractionError("Adaptive extraction profile fallback exhausted")
 
 
 def _create_tables(conn: sqlite3.Connection) -> None:
@@ -666,7 +716,7 @@ def main() -> int:
         raise ValueError("retries_on_invalid_json must be >= 0")
 
     output_root = Path(args.output_root)
-    run_stamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
+    run_stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
     output_run_dir = output_root / f"run_{run_stamp}"
     output_run_dir.mkdir(parents=True, exist_ok=True)
 
@@ -812,15 +862,21 @@ def main() -> int:
             summary_row["pdf_size_bytes"] = pdf_size_bytes
             summary_row["approx_llm_tokens"] = approx_llm_tokens
 
-            extraction_payload, warnings_payload, model_used = _extract_with_model_fallback(
+            (
+                extraction_payload,
+                warnings_payload,
+                model_used,
+                schema_profile_used,
+                schema_profile_fallback_errors,
+            ) = _extract_with_adaptive_schema_fallback(
                 api_key=openrouter_api_key,
                 model_candidates=model_candidates,
                 document_path=downloaded_path,
-                extraction_types=extraction_types,
+                schema_profile=args.schema_profile,
                 retries_on_invalid_json=args.retries_on_invalid_json,
             )
             if (
-                args.schema_profile == "compact_single_call"
+                schema_profile_used == "compact_single_call"
                 and extraction_payload.get("academy_trust_annual_report") is None
             ):
                 derived = _derive_annual_report_from_component_sections(extraction_payload)
@@ -849,7 +905,9 @@ def main() -> int:
                 "model": args.model,
                 "model_used": model_used,
                 "schema_profile": args.schema_profile,
-                "requested_types": [t.value for t in extraction_types],
+                "schema_profile_used": schema_profile_used,
+                "schema_profile_fallback_errors": schema_profile_fallback_errors,
+                "requested_types": [t.value for t in _extraction_types_for_schema_profile(schema_profile_used)],
                 "extraction_result": extraction_payload,
             }
 
@@ -897,6 +955,8 @@ def main() -> int:
                     "pdf_size_bytes": pdf_size_bytes,
                     "approx_llm_tokens": approx_llm_tokens,
                     "model_used": model_used,
+                    "schema_profile_used": schema_profile_used,
+                    "schema_profile_fallback_errors": schema_profile_fallback_errors,
                     "error": None,
                 }
             )
