@@ -250,6 +250,20 @@ Core Python modules:
 Expected env variable:
 - `CH_API_KEY` (stored in `.env`)
 
+Document cache behavior (default enabled in `CompaniesHouseClient`):
+- `download_document(...)` is cache-first and keyed by immutable `document_id` + `Accept` media type.
+- Default cache root: `output\ch_document_cache`
+- Cache key layout: `output\ch_document_cache\<accept_sanitized>\<document_id>.bin`
+- On cache hit: no Companies House download request is sent; cached bytes are copied to requested `output_path`.
+- On cache miss: document is downloaded once, atomically persisted to cache, then copied to `output_path`.
+- Empty/corrupt cache files (zero bytes) are treated as misses and re-downloaded.
+- Cross-process lock files are used to avoid duplicate downloads for the same document (`.lock` sidecar per cache file).
+
+Client cache configuration:
+- `cache_enabled=True`
+- `cache_dir=\"output/ch_document_cache\"`
+- `cache_lock_timeout_seconds=30.0`
+
 ## 10) Cleanup Guidance
 
 After confirming this file and your scripts are enough, you can remove the saved HTML folders/files:
@@ -406,6 +420,7 @@ Per-run output layout:
 - Optional deep OpenRouter debug artifacts (when `--write-openrouter-debug-artifacts` is set): `output\trusts_extraction\run_<UTCSTAMP>\<company_number>\extraction\openrouter_debug\<model>_attemptN\openrouter_request_payload.json`, `response_format.json_schema.schema.json`, and `raw_openrouter_response.json`
 - Optional run summary: `output\trusts_extraction\run_<UTCSTAMP>\summary.json` (when `--write-summary-json` is set)
 - Structured debug timeline: `output\trusts_extraction\run_<UTCSTAMP>\events.jsonl` with per-company stage start/end events, durations, and failure context
+- `download_document` stage end events include `cache_hit` (`true`/`false`) to show whether document bytes came from local cache
 - Per-company summary entries now include `schema_profile` and `schema_profile_fallback_applied` to show when adaptive fallback was used
 
 SQLite persistence:

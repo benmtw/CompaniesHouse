@@ -1,5 +1,8 @@
 import base64
+import contextlib
 import os
+import re
+import shutil
 import time
 from enum import Enum
 from pathlib import Path
@@ -81,6 +84,9 @@ class CompaniesHouseClient:
         max_retries_on_429: int = 3,
         retry_backoff_seconds: float = 10.0,
         respect_retry_after: bool = True,
+        cache_enabled: bool = True,
+        cache_dir: str = "output/ch_document_cache",
+        cache_lock_timeout_seconds: float = 30.0,
     ) -> None:
         """Configure API auth/session and validate required runtime settings."""
         resolved_key = api_key or os.getenv("CH_API_KEY")
@@ -94,6 +100,8 @@ class CompaniesHouseClient:
             raise ValueError("max_retries_on_429 must be >= 0")
         if retry_backoff_seconds < 0:
             raise ValueError("retry_backoff_seconds must be >= 0")
+        if cache_lock_timeout_seconds <= 0:
+            raise ValueError("cache_lock_timeout_seconds must be > 0")
 
         token = base64.b64encode(f"{resolved_key}:".encode("ascii")).decode("ascii")
         self._headers = {"Authorization": f"Basic {token}"}
@@ -103,6 +111,10 @@ class CompaniesHouseClient:
         self.max_retries_on_429 = max_retries_on_429
         self.retry_backoff_seconds = retry_backoff_seconds
         self.respect_retry_after = respect_retry_after
+        self.cache_enabled = cache_enabled
+        self.cache_dir = Path(cache_dir)
+        self.cache_lock_timeout_seconds = cache_lock_timeout_seconds
+        self.last_download_cache_hit: bool | None = None
         self.session = requests.Session()
 
     def search_companies(
@@ -266,9 +278,48 @@ class CompaniesHouseClient:
         self._require_non_empty(output_path, "output_path")
         self._require_non_empty(accept, "accept")
 
+        target = Path(output_path)
+        if self.cache_enabled:
+            cache_path = self._cache_file_path(document_id=document_id, accept=accept)
+            if self._is_usable_file(cache_path):
+                self.last_download_cache_hit = True
+                self._copy_if_needed(cache_path=cache_path, target=target)
+                return str(target)
+
+            lock_path = cache_path.with_suffix(cache_path.suffix + ".lock")
+            with self._cache_lock(lock_path):
+                if self._is_usable_file(cache_path):
+                    self.last_download_cache_hit = True
+                    self._copy_if_needed(cache_path=cache_path, target=target)
+                    return str(target)
+
+                self._download_document_to_path(
+                    document_id=document_id,
+                    destination=cache_path,
+                    accept=accept,
+                )
+                self.last_download_cache_hit = False
+
+            self._copy_if_needed(cache_path=cache_path, target=target)
+            return str(target)
+
+        self._download_document_to_path(
+            document_id=document_id,
+            destination=target,
+            accept=accept,
+        )
+        self.last_download_cache_hit = False
+        return str(target)
+
+    def _download_document_to_path(
+        self,
+        document_id: str,
+        destination: Path,
+        accept: str,
+    ) -> None:
+        """Download a document from Companies House and atomically write to `destination`."""
         url = f"{self.document_base_url}/document/{document_id}/content"
-        headers = {"Accept": accept}
-        combined_headers = {**self._headers, **headers}
+        combined_headers = {**self._headers, "Accept": accept}
 
         response = self._request_with_rate_limit(
             method="GET",
@@ -287,14 +338,53 @@ class CompaniesHouseClient:
                 response_body=body,
             )
 
-        target = Path(output_path)
-        target.parent.mkdir(parents=True, exist_ok=True)
-        with target.open("wb") as fh:
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        temp_path = destination.with_suffix(destination.suffix + ".part")
+        with temp_path.open("wb") as fh:
             for chunk in response.iter_content(chunk_size=8192):
                 if chunk:
                     fh.write(chunk)
+        os.replace(temp_path, destination)
 
-        return str(target)
+    def _cache_file_path(self, document_id: str, accept: str) -> Path:
+        """Resolve deterministic cache path for a CH document and requested media type."""
+        safe_accept = re.sub(r"[^A-Za-z0-9._-]+", "_", accept.strip().lower())
+        return self.cache_dir / safe_accept / f"{document_id}.bin"
+
+    @staticmethod
+    def _is_usable_file(path: Path) -> bool:
+        return path.exists() and path.is_file() and path.stat().st_size > 0
+
+    @staticmethod
+    def _copy_if_needed(cache_path: Path, target: Path) -> None:
+        """Materialize cached content to caller's target path unless already the same file."""
+        target.parent.mkdir(parents=True, exist_ok=True)
+        if cache_path.resolve() == target.resolve():
+            return
+        shutil.copy2(cache_path, target)
+
+    @contextlib.contextmanager
+    def _cache_lock(self, lock_path: Path):
+        """Cross-process lock via lock file; avoids duplicate downloads per document id."""
+        lock_path.parent.mkdir(parents=True, exist_ok=True)
+        fd: int | None = None
+        started = time.monotonic()
+        while True:
+            try:
+                fd = os.open(str(lock_path), os.O_CREAT | os.O_EXCL | os.O_RDWR)
+                break
+            except FileExistsError:
+                if (time.monotonic() - started) >= self.cache_lock_timeout_seconds:
+                    raise TimeoutError(f"Timed out waiting for cache lock: {lock_path}")
+                time.sleep(0.1)
+
+        try:
+            yield
+        finally:
+            if fd is not None:
+                os.close(fd)
+            with contextlib.suppress(FileNotFoundError):
+                lock_path.unlink()
 
     def extract_latest_full_accounts(
         self,

@@ -2,6 +2,7 @@ import base64
 import os
 import tempfile
 import unittest
+from pathlib import Path
 from unittest.mock import Mock, patch
 
 from companies_house_client import (
@@ -240,27 +241,28 @@ class CompaniesHouseClientTests(unittest.TestCase):
         self.assertEqual(latest_appt["document_id"], "new-appt")
 
     def test_download_document_success(self):
-        client = CompaniesHouseClient(api_key="k")
-        client.session.request = Mock(
-            return_value=DummyResponse(ok=True, chunks=[b"hello", b"world"])
-        )
-
         with tempfile.TemporaryDirectory() as tmp:
+            client = CompaniesHouseClient(api_key="k", cache_dir=os.path.join(tmp, "cache"))
+            client.session.request = Mock(
+                return_value=DummyResponse(ok=True, chunks=[b"hello", b"world"])
+            )
             path = os.path.join(tmp, "doc.pdf")
             out = client.download_document("abc123", path)
             self.assertEqual(out, path)
+            self.assertEqual(client.last_download_cache_hit, False)
             with open(path, "rb") as fh:
                 self.assertEqual(fh.read(), b"helloworld")
 
     def test_download_document_error_raises(self):
-        client = CompaniesHouseClient(api_key="k")
-        client.session.request = Mock(
-            return_value=DummyResponse(ok=False, status_code=406, text="not acceptable")
-        )
+        with tempfile.TemporaryDirectory() as tmp:
+            client = CompaniesHouseClient(api_key="k", cache_dir=os.path.join(tmp, "cache"))
+            client.session.request = Mock(
+                return_value=DummyResponse(ok=False, status_code=406, text="not acceptable")
+            )
 
-        with self.assertRaises(CompaniesHouseApiError) as ctx:
-            client.download_document("abc123", "x.pdf")
-        self.assertEqual(ctx.exception.status_code, 406)
+            with self.assertRaises(CompaniesHouseApiError) as ctx:
+                client.download_document("abc123", os.path.join(tmp, "x.pdf"))
+            self.assertEqual(ctx.exception.status_code, 406)
 
     def test_extract_document_id_from_full_url(self):
         self.assertEqual(
@@ -303,18 +305,96 @@ class CompaniesHouseClientTests(unittest.TestCase):
 
     @patch("companies_house_client.time.sleep", return_value=None)
     def test_download_document_retries_on_429(self, _sleep_mock):
-        client = CompaniesHouseClient(api_key="k", max_retries_on_429=1)
-        r1 = DummyResponse(ok=False, status_code=429, text="too many")
-        r2 = DummyResponse(ok=True, status_code=200, chunks=[b"file"])
-        client.session.request = Mock(side_effect=[r1, r2])
-
         with tempfile.TemporaryDirectory() as tmp:
+            client = CompaniesHouseClient(
+                api_key="k",
+                max_retries_on_429=1,
+                cache_dir=os.path.join(tmp, "cache"),
+            )
+            r1 = DummyResponse(ok=False, status_code=429, text="too many")
+            r2 = DummyResponse(ok=True, status_code=200, chunks=[b"file"])
+            client.session.request = Mock(side_effect=[r1, r2])
             path = os.path.join(tmp, "doc.pdf")
             out = client.download_document("abc123", path)
             self.assertEqual(out, path)
             with open(path, "rb") as fh:
                 self.assertEqual(fh.read(), b"file")
         self.assertEqual(client.session.request.call_count, 2)
+
+    def test_download_document_cache_hit_skips_http(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            cache_dir = os.path.join(tmp, "cache")
+            client = CompaniesHouseClient(api_key="k", cache_dir=cache_dir)
+            cache_path = client._cache_file_path("abc123", "application/pdf")
+            cache_path.parent.mkdir(parents=True, exist_ok=True)
+            cache_path.write_bytes(b"cached")
+            client.session.request = Mock()
+
+            out_path = os.path.join(tmp, "out", "doc.pdf")
+            out = client.download_document("abc123", out_path)
+
+            self.assertEqual(out, out_path)
+            self.assertEqual(client.last_download_cache_hit, True)
+            with open(out_path, "rb") as fh:
+                self.assertEqual(fh.read(), b"cached")
+            client.session.request.assert_not_called()
+
+    def test_download_document_cache_miss_populates_cache(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            cache_dir = os.path.join(tmp, "cache")
+            client = CompaniesHouseClient(api_key="k", cache_dir=cache_dir)
+            client.session.request = Mock(
+                return_value=DummyResponse(ok=True, status_code=200, chunks=[b"filedata"])
+            )
+
+            out_path = os.path.join(tmp, "out", "doc.pdf")
+            client.download_document("abc123", out_path)
+
+            cache_path = client._cache_file_path("abc123", "application/pdf")
+            self.assertEqual(client.last_download_cache_hit, False)
+            self.assertTrue(cache_path.exists())
+            self.assertEqual(cache_path.read_bytes(), b"filedata")
+            self.assertEqual(Path(out_path).read_bytes(), b"filedata")
+            client.session.request.assert_called_once()
+
+    def test_download_document_uses_cache_on_second_call(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            cache_dir = os.path.join(tmp, "cache")
+            client = CompaniesHouseClient(api_key="k", cache_dir=cache_dir)
+            client.session.request = Mock(
+                return_value=DummyResponse(ok=True, status_code=200, chunks=[b"filedata"])
+            )
+
+            first_out = os.path.join(tmp, "out1", "doc.pdf")
+            second_out = os.path.join(tmp, "out2", "doc.pdf")
+
+            client.download_document("abc123", first_out)
+            self.assertEqual(client.last_download_cache_hit, False)
+            client.session.request.reset_mock()
+            client.download_document("abc123", second_out)
+
+            self.assertEqual(client.last_download_cache_hit, True)
+            client.session.request.assert_not_called()
+            self.assertEqual(Path(second_out).read_bytes(), b"filedata")
+
+    def test_download_document_empty_cache_file_triggers_redownload(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            cache_dir = os.path.join(tmp, "cache")
+            client = CompaniesHouseClient(api_key="k", cache_dir=cache_dir)
+            cache_path = client._cache_file_path("abc123", "application/pdf")
+            cache_path.parent.mkdir(parents=True, exist_ok=True)
+            cache_path.write_bytes(b"")
+
+            client.session.request = Mock(
+                return_value=DummyResponse(ok=True, status_code=200, chunks=[b"fresh"])
+            )
+
+            out_path = os.path.join(tmp, "out", "doc.pdf")
+            client.download_document("abc123", out_path)
+
+            client.session.request.assert_called_once()
+            self.assertEqual(cache_path.read_bytes(), b"fresh")
+            self.assertEqual(Path(out_path).read_bytes(), b"fresh")
 
     @patch("companies_house_client.time.sleep", return_value=None)
     def test_retry_after_header_is_preferred(self, sleep_mock):

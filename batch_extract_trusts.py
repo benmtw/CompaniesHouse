@@ -950,7 +950,11 @@ def main() -> int:
                 output_path=str(pdf_path),
                 accept="application/pdf",
             )
-            stage_end("ok", pdf_path=str(pdf_path))
+            stage_end(
+                "ok",
+                pdf_path=str(pdf_path),
+                cache_hit=client.last_download_cache_hit,
+            )
             pdf_size_bytes = Path(downloaded_path).stat().st_size
             approx_llm_tokens = _estimate_llm_tokens_for_pdf_bytes(pdf_size_bytes)
             summary_row["pdf_path"] = str(pdf_path)
