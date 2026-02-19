@@ -1,9 +1,11 @@
 import base64
 import contextlib
+import json
 import os
 import re
 import shutil
 import time
+from datetime import UTC, datetime
 from enum import Enum
 from pathlib import Path
 from typing import Any
@@ -267,7 +269,11 @@ class CompaniesHouseClient:
         return sorted(docs, key=lambda d: (d.get("date") or ""), reverse=True)[0]
 
     def download_document(
-        self, document_id: str, output_path: str, accept: str = "application/pdf"
+        self,
+        document_id: str,
+        output_path: str,
+        accept: str = "application/pdf",
+        company_number: str | None = None,
     ) -> str:
         """
         Download a filing document to disk using the requested `Accept` type.
@@ -277,6 +283,10 @@ class CompaniesHouseClient:
         self._require_non_empty(document_id, "document_id")
         self._require_non_empty(output_path, "output_path")
         self._require_non_empty(accept, "accept")
+        if company_number is not None:
+            company_number = company_number.strip()
+            if not company_number:
+                company_number = None
 
         target = Path(output_path)
         if self.cache_enabled:
@@ -284,6 +294,13 @@ class CompaniesHouseClient:
             if self._is_usable_file(cache_path):
                 self.last_download_cache_hit = True
                 self._copy_if_needed(cache_path=cache_path, target=target)
+                self._record_cache_index(
+                    document_id=document_id,
+                    accept=accept,
+                    cache_path=cache_path,
+                    cache_hit=True,
+                    company_number=company_number,
+                )
                 return str(target)
 
             lock_path = cache_path.with_suffix(cache_path.suffix + ".lock")
@@ -291,6 +308,13 @@ class CompaniesHouseClient:
                 if self._is_usable_file(cache_path):
                     self.last_download_cache_hit = True
                     self._copy_if_needed(cache_path=cache_path, target=target)
+                    self._record_cache_index(
+                        document_id=document_id,
+                        accept=accept,
+                        cache_path=cache_path,
+                        cache_hit=True,
+                        company_number=company_number,
+                    )
                     return str(target)
 
                 self._download_document_to_path(
@@ -301,6 +325,13 @@ class CompaniesHouseClient:
                 self.last_download_cache_hit = False
 
             self._copy_if_needed(cache_path=cache_path, target=target)
+            self._record_cache_index(
+                document_id=document_id,
+                accept=accept,
+                cache_path=cache_path,
+                cache_hit=False,
+                company_number=company_number,
+            )
             return str(target)
 
         self._download_document_to_path(
@@ -310,6 +341,33 @@ class CompaniesHouseClient:
         )
         self.last_download_cache_hit = False
         return str(target)
+
+    def _record_cache_index(
+        self,
+        document_id: str,
+        accept: str,
+        cache_path: Path,
+        cache_hit: bool,
+        company_number: str | None,
+    ) -> None:
+        """Append cache lookup metadata for reverse-mapping document ids to companies."""
+        if not company_number:
+            return
+
+        index_path = self.cache_dir / "cache_index.jsonl"
+        lock_path = self.cache_dir / "cache_index.lock"
+        payload = {
+            "ts_utc": datetime.now(UTC).isoformat(timespec="milliseconds"),
+            "document_id": document_id,
+            "company_number": company_number,
+            "accept": accept,
+            "cache_path": str(cache_path),
+            "cache_hit": cache_hit,
+        }
+        with self._cache_lock(lock_path):
+            index_path.parent.mkdir(parents=True, exist_ok=True)
+            with index_path.open("a", encoding="utf-8") as fh:
+                fh.write(json.dumps(payload, ensure_ascii=True) + "\n")
 
     def _download_document_to_path(
         self,

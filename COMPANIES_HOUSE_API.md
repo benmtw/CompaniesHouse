@@ -270,6 +270,7 @@ Document cache behavior (default enabled in `CompaniesHouseClient`):
 - `download_document(...)` is cache-first and keyed by immutable `document_id` + `Accept` media type.
 - Default cache root: `output\ch_document_cache`
 - Cache key layout: `output\ch_document_cache\<accept_sanitized>\<document_id>.bin`
+- Optional reverse index: `output\ch_document_cache\cache_index.jsonl` (written when `company_number` is passed to `download_document(...)`)
 - On cache hit: no Companies House download request is sent; cached bytes are copied to requested `output_path`.
 - On cache miss: document is downloaded once, atomically persisted to cache, then copied to `output_path`.
 - Empty/corrupt cache files (zero bytes) are treated as misses and re-downloaded.

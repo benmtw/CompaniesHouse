@@ -236,6 +236,7 @@ def main() -> int:
                 document_id=document_id,
                 output_path=str(pdf_path),
                 accept="application/pdf",
+                company_number=company_number,
             )
 
             row_summary["document_id"] = document_id

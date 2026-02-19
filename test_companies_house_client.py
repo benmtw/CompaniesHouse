@@ -1,4 +1,5 @@
 import base64
+import json
 import os
 import tempfile
 import unittest
@@ -356,6 +357,52 @@ class CompaniesHouseClientTests(unittest.TestCase):
             self.assertEqual(cache_path.read_bytes(), b"filedata")
             self.assertEqual(Path(out_path).read_bytes(), b"filedata")
             client.session.request.assert_called_once()
+
+    def test_download_document_writes_cache_index_when_company_number_provided(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            cache_dir = os.path.join(tmp, "cache")
+            client = CompaniesHouseClient(api_key="k", cache_dir=cache_dir)
+            client.session.request = Mock(
+                return_value=DummyResponse(ok=True, status_code=200, chunks=[b"filedata"])
+            )
+
+            out_path = os.path.join(tmp, "out", "doc.pdf")
+            client.download_document(
+                "abc123",
+                out_path,
+                company_number="09618502",
+            )
+
+            index_path = Path(cache_dir) / "cache_index.jsonl"
+            self.assertTrue(index_path.exists())
+            rows = [json.loads(line) for line in index_path.read_text(encoding="utf-8").splitlines()]
+            self.assertEqual(len(rows), 1)
+            self.assertEqual(rows[0]["document_id"], "abc123")
+            self.assertEqual(rows[0]["company_number"], "09618502")
+            self.assertEqual(rows[0]["accept"], "application/pdf")
+            self.assertEqual(rows[0]["cache_hit"], False)
+
+    def test_download_document_cache_hit_writes_index_entry(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            cache_dir = os.path.join(tmp, "cache")
+            client = CompaniesHouseClient(api_key="k", cache_dir=cache_dir)
+            cache_path = client._cache_file_path("abc123", "application/pdf")
+            cache_path.parent.mkdir(parents=True, exist_ok=True)
+            cache_path.write_bytes(b"cached")
+            client.session.request = Mock()
+
+            out_path = os.path.join(tmp, "out", "doc.pdf")
+            client.download_document(
+                "abc123",
+                out_path,
+                company_number="09618502",
+            )
+
+            index_path = Path(cache_dir) / "cache_index.jsonl"
+            rows = [json.loads(line) for line in index_path.read_text(encoding="utf-8").splitlines()]
+            self.assertEqual(len(rows), 1)
+            self.assertEqual(rows[0]["cache_hit"], True)
+            client.session.request.assert_not_called()
 
     def test_download_document_uses_cache_on_second_call(self):
         with tempfile.TemporaryDirectory() as tmp:
