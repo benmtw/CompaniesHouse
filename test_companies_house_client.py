@@ -17,6 +17,10 @@ from companies_house_client import (
     OpenRouterDocumentExtractor,
     PersonnelDetail,
 )
+from batch_extract_trusts import (
+    _extract_with_adaptive_schema_fallback,
+    _is_schema_depth_error,
+)
 
 
 class DummyResponse:
@@ -916,6 +920,42 @@ class OpenRouterDocumentExtractorTests(unittest.TestCase):
         self.assertEqual(out["personnel_details"], [])
         self.assertEqual(out["balance_sheet"], [])
         mocked.assert_called()
+
+
+class BatchAdaptiveSchemaFallbackTests(unittest.TestCase):
+    def test_is_schema_depth_error_detects_known_provider_message(self):
+        exc = DocumentExtractionError(
+            "HTTP 400: A schema in GenerationConfig in the request exceeds the maximum allowed nesting depth."
+        )
+        self.assertTrue(_is_schema_depth_error(exc))
+
+    def test_extract_with_adaptive_schema_fallback_retries_with_light_core(self):
+        schema_exc = DocumentExtractionError(
+            "HTTP 400: A schema in GenerationConfig in the request exceeds the maximum allowed nesting depth."
+        )
+
+        with patch("batch_extract_trusts._extract_with_model_fallback") as mocked_extract:
+            mocked_extract.side_effect = [
+                schema_exc,
+                ({"metadata": {}}, [], "google/gemini-2.5-flash-lite"),
+            ]
+
+            payload, warnings, model_used, schema_profile_used, profile_errors = (
+                _extract_with_adaptive_schema_fallback(
+                    api_key="or_key",
+                    model_candidates=["google/gemini-2.5-flash-lite"],
+                    document_path="sample.pdf",
+                    schema_profile="compact_single_call",
+                    retries_on_invalid_json=2,
+                )
+            )
+
+        self.assertEqual(payload, {"metadata": {}})
+        self.assertEqual(warnings, [])
+        self.assertEqual(model_used, "google/gemini-2.5-flash-lite")
+        self.assertEqual(schema_profile_used, "light_core")
+        self.assertEqual(len(profile_errors), 1)
+        self.assertIn("compact_single_call", profile_errors[0])
 
 
 class CompaniesHouseLiveSmokeTest(unittest.TestCase):

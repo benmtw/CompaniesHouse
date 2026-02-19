@@ -391,6 +391,7 @@ Useful controls:
 - `--filing-history-items-per-page 100` fetches only the first filing-history page for latest full-accounts selection (faster and lower request volume)
 - `--retries-on-invalid-json 0` to disable same-model retries on malformed LLM JSON for faster high-volume runs
 - `--schema-profile compact_single_call` (default) reduces schema nesting by removing duplicate deep annual-report branch from the request; `full_legacy` keeps prior full schema; `light_core` requests only lightweight sections
+- Adaptive schema fallback: when `--schema-profile compact_single_call` is used and the provider returns a schema-depth `HTTP 400`, batch extraction automatically retries once with `light_core` for that company before failing.
 
 Per-run output layout:
 - `output\trusts_extraction\run_<UTCSTAMP>\<company_number>\documents\<company_number>_latest_full_accounts_<document_id>.pdf`
@@ -406,6 +407,7 @@ SQLite persistence:
 - Table `runs`: one row per batch run with counters and model metadata
 - Table `company_reports`: one row per company with status, document id, file paths, `model_used`, `pdf_size_bytes`, `approx_llm_tokens`, error text, and JSON payloads (`profile_json`, `filing_history_json`, `extraction_json`, `warnings_json`)
 - Batch extractor behavior: retries the same model up to 3 attempts total when OpenRouter returns non-JSON content, to reduce transient parse failures.
+- Per-company run summary rows include `schema_profile_used` and `schema_profile_fallback_errors` to make adaptive fallback behavior visible in diagnostics.
 
 ## 13) Smoke Test And Final Validation
 
