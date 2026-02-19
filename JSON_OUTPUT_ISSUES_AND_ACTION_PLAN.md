@@ -209,7 +209,7 @@ Cons:
 
 ## Recommended Next Steps
 
-1. Implement adaptive profile fallback in batch (minimal-call strategy):
+1. [x] Implemented adaptive profile fallback in batch (minimal-call strategy):
 - `compact_single_call` -> fallback to `light_core` on schema-depth error only.
 
 2. Add explicit response-shape diagnostics in summary:

@@ -207,6 +207,11 @@ def _is_invalid_json_error(exc: Exception) -> bool:
     return "response was not valid json" in str(exc).lower()
 
 
+def _is_schema_depth_error(exc: Exception) -> bool:
+    message = str(exc).lower()
+    return "maximum allowed nesting depth" in message or "schema-depth" in message
+
+
 def _install_companies_house_request_throttle(
     client: CompaniesHouseClient, min_interval_seconds: float
 ) -> dict[str, Any]:
@@ -812,17 +817,39 @@ def main() -> int:
             summary_row["pdf_size_bytes"] = pdf_size_bytes
             summary_row["approx_llm_tokens"] = approx_llm_tokens
 
-            extraction_payload, warnings_payload, model_used = _extract_with_model_fallback(
-                api_key=openrouter_api_key,
-                model_candidates=model_candidates,
-                document_path=downloaded_path,
-                extraction_types=extraction_types,
-                retries_on_invalid_json=args.retries_on_invalid_json,
-            )
-            if (
-                args.schema_profile == "compact_single_call"
-                and extraction_payload.get("academy_trust_annual_report") is None
-            ):
+            extraction_schema_profile = args.schema_profile
+            had_schema_depth_error = False
+            run_extraction_types = extraction_types
+
+            try:
+                extraction_payload, warnings_payload, model_used = _extract_with_model_fallback(
+                    api_key=openrouter_api_key,
+                    model_candidates=model_candidates,
+                    document_path=downloaded_path,
+                    extraction_types=run_extraction_types,
+                    retries_on_invalid_json=args.retries_on_invalid_json,
+                )
+            except DocumentExtractionError as exc:
+                if (
+                    args.schema_profile == "compact_single_call"
+                    and _is_schema_depth_error(exc)
+                ):
+                    had_schema_depth_error = True
+                    extraction_schema_profile = "light_core"
+                    run_extraction_types = _extraction_types_for_schema_profile(
+                        extraction_schema_profile
+                    )
+                    extraction_payload, warnings_payload, model_used = _extract_with_model_fallback(
+                        api_key=openrouter_api_key,
+                        model_candidates=model_candidates,
+                        document_path=downloaded_path,
+                        extraction_types=run_extraction_types,
+                        retries_on_invalid_json=args.retries_on_invalid_json,
+                    )
+                else:
+                    raise
+
+            if extraction_payload.get("academy_trust_annual_report") is None:
                 derived = _derive_annual_report_from_component_sections(extraction_payload)
                 if derived is not None:
                     extraction_payload["academy_trust_annual_report"] = derived
@@ -848,8 +875,9 @@ def main() -> int:
                 "approx_llm_tokens": approx_llm_tokens,
                 "model": args.model,
                 "model_used": model_used,
-                "schema_profile": args.schema_profile,
-                "requested_types": [t.value for t in extraction_types],
+                "schema_profile": extraction_schema_profile,
+                "requested_types": [t.value for t in run_extraction_types],
+                "schema_profile_fallback_applied": had_schema_depth_error,
                 "extraction_result": extraction_payload,
             }
 
@@ -897,6 +925,8 @@ def main() -> int:
                     "pdf_size_bytes": pdf_size_bytes,
                     "approx_llm_tokens": approx_llm_tokens,
                     "model_used": model_used,
+                    "schema_profile": extraction_schema_profile,
+                    "schema_profile_fallback_applied": had_schema_depth_error,
                     "error": None,
                 }
             )
