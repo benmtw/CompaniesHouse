@@ -182,6 +182,16 @@ def _utc_now() -> str:
     return datetime.now(UTC).replace(microsecond=0).isoformat()
 
 
+def _utc_now_precise() -> str:
+    return datetime.now(UTC).isoformat(timespec="milliseconds")
+
+
+def _append_jsonl(path: Path, payload: dict[str, Any]) -> None:
+    _ensure_parent(path)
+    with path.open("a", encoding="utf-8") as fh:
+        fh.write(json.dumps(payload, ensure_ascii=True) + "\n")
+
+
 def _parse_fallback_models(raw_models: str) -> list[str]:
     out: list[str] = []
     seen: set[str] = set()
@@ -342,12 +352,17 @@ def _extract_with_model_fallback(
     document_path: str,
     extraction_types: list[ExtractionType],
     retries_on_invalid_json: int = 2,
+    openrouter_timeout_seconds: float = 180.0,
 ) -> tuple[dict[str, Any], list[str], str]:
     errors: list[str] = []
     for model in model_candidates:
         attempts = retries_on_invalid_json + 1
         for attempt in range(1, attempts + 1):
-            extractor = OpenRouterDocumentExtractor(api_key=api_key, model=model)
+            extractor = OpenRouterDocumentExtractor(
+                api_key=api_key,
+                model=model,
+                request_timeout_seconds=openrouter_timeout_seconds,
+            )
             try:
                 result = extractor.extract(
                     document_path=document_path,
@@ -634,6 +649,12 @@ def build_parser() -> argparse.ArgumentParser:
         help="Number of same-model retries when extraction output is malformed JSON (default 2)",
     )
     parser.add_argument(
+        "--openrouter-timeout-seconds",
+        type=float,
+        default=float(os.getenv("OPENROUTER_TIMEOUT_SECONDS", "180")),
+        help="HTTP timeout for each OpenRouter extraction call in seconds (default 180)",
+    )
+    parser.add_argument(
         "--schema-profile",
         choices=["compact_single_call", "full_legacy", "light_core"],
         default=os.getenv("BATCH_SCHEMA_PROFILE", "compact_single_call"),
@@ -669,6 +690,8 @@ def main() -> int:
         raise ValueError("filing_history_items_per_page must be > 0")
     if args.retries_on_invalid_json < 0:
         raise ValueError("retries_on_invalid_json must be >= 0")
+    if args.openrouter_timeout_seconds <= 0:
+        raise ValueError("openrouter_timeout_seconds must be > 0")
 
     output_root = Path(args.output_root)
     run_stamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
@@ -689,6 +712,17 @@ def main() -> int:
         model=args.model,
         extraction_types=extraction_types,
     )
+    events_jsonl_path = output_run_dir / "events.jsonl"
+
+    def emit_event(event_type: str, **fields: Any) -> None:
+        payload: dict[str, Any] = {
+            "ts_utc": _utc_now_precise(),
+            "run_id": run_id,
+            "event": event_type,
+        }
+        payload.update(fields)
+        _append_jsonl(events_jsonl_path, payload)
+
     print(f"[run {run_id}] output_dir={output_run_dir}")
     print(f"[run {run_id}] db_path={db_path}")
 
@@ -746,7 +780,25 @@ def main() -> int:
             run_id, args.retries_on_invalid_json
         )
     )
+    print(
+        "[run {}] openrouter_timeout_seconds={}".format(
+            run_id, args.openrouter_timeout_seconds
+        )
+    )
     print("[run {}] schema_profile={}".format(run_id, args.schema_profile))
+    emit_event(
+        "run_started",
+        output_run_dir=str(output_run_dir),
+        input_xlsx_path=str(input_xlsx),
+        model=args.model,
+        model_candidates=model_candidates,
+        schema_profile=args.schema_profile,
+        total_companies=total_companies,
+        ch_min_request_interval_seconds=args.ch_min_request_interval_seconds,
+        filing_history_items_per_page=args.filing_history_items_per_page,
+        retries_on_invalid_json=args.retries_on_invalid_json,
+        openrouter_timeout_seconds=args.openrouter_timeout_seconds,
+    )
 
     client = CompaniesHouseClient(api_key=ch_api_key)
     throttle_state = _install_companies_house_request_throttle(
@@ -764,6 +816,7 @@ def main() -> int:
         company_number = item["company_number"]
         prefix = f"[run {run_id}] [{processed}/{total_companies}] {company_number}"
         print(f"{prefix} start")
+        company_started_monotonic = time.monotonic()
         company_dir = output_run_dir / company_number
         api_dir = company_dir / "api"
         doc_dir = company_dir / "documents"
@@ -787,30 +840,72 @@ def main() -> int:
             "model_used": None,
             "error": None,
         }
+        current_stage_started_monotonic = company_started_monotonic
+
+        def stage_start(stage_name: str) -> None:
+            nonlocal stage, current_stage_started_monotonic
+            stage = stage_name
+            current_stage_started_monotonic = time.monotonic()
+            emit_event(
+                "company_stage_start",
+                index=processed,
+                total=total_companies,
+                company_number=company_number,
+                stage=stage_name,
+            )
+
+        def stage_end(status: str, **fields: Any) -> None:
+            emit_event(
+                "company_stage_end",
+                index=processed,
+                total=total_companies,
+                company_number=company_number,
+                stage=stage,
+                status=status,
+                duration_seconds=round(
+                    time.monotonic() - current_stage_started_monotonic, 3
+                ),
+                **fields,
+            )
+
+        emit_event(
+            "company_start",
+            index=processed,
+            total=total_companies,
+            company_number=company_number,
+            source_row_index=item["source_row_index"],
+            group_uid=item.get("group_uid"),
+            group_id=item.get("group_id"),
+            group_name=item.get("group_name"),
+        )
 
         try:
+            stage_start("get_company_profile")
             profile = client.get_company_profile(company_number)
-            stage = "profile_ok"
+            stage_end("ok")
+            stage_start("get_filing_history")
             filing_history_page = client.get_filing_history(
                 company_number=company_number,
                 items_per_page=args.filing_history_items_per_page,
                 start_index=0,
             )
             filing_history = filing_history_page.get("items") or []
-            stage = "filing_history_ok"
+            stage_end("ok", filing_items=len(filing_history))
+            stage_start("select_latest_full_accounts")
             document_id = _latest_full_accounts_document_id_from_filing_history(filing_history)
             if not document_id:
                 raise ValueError("No full accounts document found")
-            stage = "latest_document_ok"
+            stage_end("ok", document_id=document_id)
             summary_row["document_id"] = document_id
 
+            stage_start("download_document")
             pdf_path = doc_dir / f"{company_number}_latest_full_accounts_{document_id}.pdf"
             downloaded_path = client.download_document(
                 document_id=document_id,
                 output_path=str(pdf_path),
                 accept="application/pdf",
             )
-            stage = "download_ok"
+            stage_end("ok", pdf_path=str(pdf_path))
             pdf_size_bytes = Path(downloaded_path).stat().st_size
             approx_llm_tokens = _estimate_llm_tokens_for_pdf_bytes(pdf_size_bytes)
             summary_row["pdf_path"] = str(pdf_path)
@@ -821,6 +916,7 @@ def main() -> int:
             had_schema_depth_error = False
             run_extraction_types = extraction_types
 
+            stage_start("openrouter_extract")
             try:
                 extraction_payload, warnings_payload, model_used = _extract_with_model_fallback(
                     api_key=openrouter_api_key,
@@ -828,6 +924,7 @@ def main() -> int:
                     document_path=downloaded_path,
                     extraction_types=run_extraction_types,
                     retries_on_invalid_json=args.retries_on_invalid_json,
+                    openrouter_timeout_seconds=args.openrouter_timeout_seconds,
                 )
             except DocumentExtractionError as exc:
                 if (
@@ -845,9 +942,16 @@ def main() -> int:
                         document_path=downloaded_path,
                         extraction_types=run_extraction_types,
                         retries_on_invalid_json=args.retries_on_invalid_json,
+                        openrouter_timeout_seconds=args.openrouter_timeout_seconds,
                     )
                 else:
                     raise
+            stage_end(
+                "ok",
+                model_used=model_used,
+                schema_profile=extraction_schema_profile,
+                schema_profile_fallback_applied=had_schema_depth_error,
+            )
 
             if extraction_payload.get("academy_trust_annual_report") is None:
                 derived = _derive_annual_report_from_component_sections(extraction_payload)
@@ -930,12 +1034,47 @@ def main() -> int:
                     "error": None,
                 }
             )
+            emit_event(
+                "company_success",
+                index=processed,
+                total=total_companies,
+                company_number=company_number,
+                company_name=profile.get("company_name"),
+                document_id=document_id,
+                model_used=model_used,
+                pdf_size_bytes=pdf_size_bytes,
+                approx_llm_tokens=approx_llm_tokens,
+                total_duration_seconds=round(
+                    time.monotonic() - company_started_monotonic, 3
+                ),
+            )
             print(f"{prefix} success document_id={document_id} model={model_used}")
         except Exception as exc:
             failed += 1
+            raw_response_json_path: Path | None = None
+            raw_response_text_path: Path | None = None
+            raw_payload = getattr(exc, "raw_response_payload", None)
+            raw_text = getattr(exc, "raw_response_text", None)
+            if raw_payload is not None:
+                raw_response_json_path = extraction_dir / "raw_openrouter_response.json"
+                write_json(raw_response_json_path, raw_payload)
+            if raw_text:
+                raw_response_text_path = extraction_dir / "raw_openrouter_response_text.txt"
+                raw_response_text_path.write_text(str(raw_text), encoding="utf-8")
+            stage_end("error", error=str(exc))
             error_message = "".join(
                 traceback.format_exception(exc.__class__, exc, exc.__traceback__)
             )[:MAX_ERROR_TRACEBACK_CHARS]
+            if raw_response_json_path is not None:
+                error_message = (
+                    error_message
+                    + f"\nraw_openrouter_response_json={raw_response_json_path}"
+                )[:MAX_ERROR_TRACEBACK_CHARS]
+            if raw_response_text_path is not None:
+                error_message = (
+                    error_message
+                    + f"\nraw_openrouter_response_text={raw_response_text_path}"
+                )[:MAX_ERROR_TRACEBACK_CHARS]
             _insert_company_row(
                 conn,
                 {
@@ -968,7 +1107,24 @@ def main() -> int:
                     "status": "failed",
                     "companies_house_stage": stage,
                     "error": str(exc),
+                    "raw_openrouter_response_json": (
+                        str(raw_response_json_path) if raw_response_json_path else None
+                    ),
+                    "raw_openrouter_response_text": (
+                        str(raw_response_text_path) if raw_response_text_path else None
+                    ),
                 }
+            )
+            emit_event(
+                "company_failed",
+                index=processed,
+                total=total_companies,
+                company_number=company_number,
+                stage=stage,
+                error=str(exc),
+                total_duration_seconds=round(
+                    time.monotonic() - company_started_monotonic, 3
+                ),
             )
             print(f"{prefix} failed error={exc}")
         company_summaries.append(summary_row)
@@ -1013,8 +1169,16 @@ def main() -> int:
             "companies": company_summaries,
         }
         write_json(summary_path, summary_payload)
+        emit_event("run_summary_written", summary_json_path=str(summary_path))
         print(f"[run {run_id}] summary_json_path={summary_path}")
 
+    emit_event(
+        "run_completed",
+        processed=processed,
+        succeeded=succeeded,
+        failed=failed,
+        companies_house_request_count=throttle_state["request_count"],
+    )
     print(
         f"[run {run_id}] complete processed={processed} succeeded={succeeded} failed={failed}"
     )

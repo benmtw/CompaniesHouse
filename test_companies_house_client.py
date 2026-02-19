@@ -546,6 +546,36 @@ class OpenRouterDocumentExtractorTests(unittest.TestCase):
         metadata_fields = schema["properties"]["metadata"]["properties"]
         self.assertEqual(metadata_fields["company_registration_number"]["pattern"], "^[0-9]{8}$")
 
+    def test_extract_metadata_pads_7_digit_company_number(self):
+        extractor = OpenRouterDocumentExtractor(api_key="or_key")
+        llm_json = """
+        {
+          "metadata": {
+            "trust_name": "LIFT SCHOOLS",
+            "company_registration_number": "6625091",
+            "financial_year_ending": "2025-08-31",
+            "accounting_officer": "Example Officer"
+          }
+        }
+        """
+        response = {
+            "choices": [{"message": {"content": llm_json}}],
+        }
+        extractor._post_openrouter_chat_completion = Mock(return_value=response)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "full_accounts.txt")
+            with open(path, "w", encoding="utf-8") as fh:
+                fh.write("Sample full accounts text")
+
+            result = extractor.extract(
+                path,
+                extraction_types=[ExtractionType.Metadata],
+            )
+
+        self.assertIsNotNone(result.metadata)
+        self.assertEqual(result.metadata.company_registration_number, "06625091")
+
     def test_extract_academy_trust_annual_report_only(self):
         extractor = OpenRouterDocumentExtractor(api_key="or_key")
         llm_json = """
@@ -874,6 +904,46 @@ class OpenRouterDocumentExtractorTests(unittest.TestCase):
         self.assertIn("staffing_data", schema["required"])
         self.assertNotIn("academy_trust_annual_report", schema["required"])
         self.assertNotIn("balance_sheet", schema["required"])
+
+    def test_extract_allows_missing_detailed_balance_sheet_with_warning(self):
+        extractor = OpenRouterDocumentExtractor(api_key="or_key")
+        llm_json = """
+        {
+          "metadata": {
+            "trust_name": "ACE LEARNING",
+            "company_registration_number": "08681270",
+            "financial_year_ending": "2025-08-31",
+            "accounting_officer": "Example Officer"
+          }
+        }
+        """
+        response = {
+            "choices": [{"message": {"content": llm_json}}],
+        }
+        extractor._post_openrouter_chat_completion = Mock(return_value=response)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "full_accounts.txt")
+            with open(path, "w", encoding="utf-8") as fh:
+                fh.write("Sample full accounts text")
+
+            result = extractor.extract(
+                path,
+                extraction_types=[
+                    ExtractionType.Metadata,
+                    ExtractionType.DetailedBalanceSheet,
+                ],
+            )
+
+        self.assertIsNotNone(result.metadata)
+        self.assertIsNone(result.detailed_balance_sheet)
+        self.assertTrue(
+            any(
+                "Section `detailed_balance_sheet` missing/null; set to null."
+                in warning
+                for warning in result.validation_warnings
+            )
+        )
 
     def test_extract_rejects_missing_personnel_fields(self):
         extractor = OpenRouterDocumentExtractor(api_key="or_key")

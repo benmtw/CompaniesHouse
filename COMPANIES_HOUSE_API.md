@@ -390,6 +390,7 @@ Useful controls:
 - `--summary-json-path "<path>"` optional explicit location for summary JSON
 - `--filing-history-items-per-page 100` fetches only the first filing-history page for latest full-accounts selection (faster and lower request volume)
 - `--retries-on-invalid-json 0` to disable same-model retries on malformed LLM JSON for faster high-volume runs
+- `--openrouter-timeout-seconds 60` to cap each OpenRouter extraction HTTP call at 1 minute (prevents long stalls on a single company)
 - `--schema-profile compact_single_call` (default) reduces schema nesting by removing duplicate deep annual-report branch from the request; `full_legacy` keeps prior full schema; `light_core` requests only lightweight sections.
 - Adaptive fallback: when `compact_single_call` fails with a provider schema-depth error, batch extraction automatically retries with `light_core` for that company only
 
@@ -400,7 +401,9 @@ Per-run output layout:
 - `output\trusts_extraction\run_<UTCSTAMP>\<company_number>\extraction\extraction_result.json`
 - `output\trusts_extraction\run_<UTCSTAMP>\<company_number>\extraction\validation_warnings.json`
 - `output\trusts_extraction\run_<UTCSTAMP>\<company_number>\extraction\run_report.json`
+- On extraction failures with provider output available: `output\trusts_extraction\run_<UTCSTAMP>\<company_number>\extraction\raw_openrouter_response.json` and `raw_openrouter_response_text.txt`
 - Optional run summary: `output\trusts_extraction\run_<UTCSTAMP>\summary.json` (when `--write-summary-json` is set)
+- Structured debug timeline: `output\trusts_extraction\run_<UTCSTAMP>\events.jsonl` with per-company stage start/end events, durations, and failure context
 - Per-company summary entries now include `schema_profile` and `schema_profile_fallback_applied` to show when adaptive fallback was used
 
 SQLite persistence:
@@ -433,3 +436,5 @@ Known limitations:
 - Reconciliation uses tolerance `abs(diff) > 1`; small rounding differences are ignored.
 - Warnings only run when all required numeric inputs for the specific check are present.
 - LLM extraction quality depends on model output and document quality/layout.
+- Metadata normalization: if LLM returns a 7-digit `company_registration_number`, extraction left-pads it to 8 digits before strict validation.
+- For object sections (`metadata`, `governance`, `statement_of_financial_activities`, `detailed_balance_sheet`, `staffing_data`, `academy_trust_annual_report`), missing/null/wrong-type values are now coerced to `null` with a validation warning instead of hard-failing the whole extraction.

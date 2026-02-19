@@ -132,9 +132,12 @@ class Metadata(BaseModel):
     @field_validator("company_registration_number")
     @classmethod
     def _company_number_must_be_8_digits(cls, value: str) -> str:
-        if len(value) != 8 or not value.isdigit():
+        normalized = value.strip()
+        if normalized.isdigit() and len(normalized) == 7:
+            normalized = normalized.zfill(8)
+        if len(normalized) != 8 or not normalized.isdigit():
             raise ValueError("must be an 8-digit company number")
-        return value
+        return normalized
 
 
 class TrusteeAttendance(BaseModel):

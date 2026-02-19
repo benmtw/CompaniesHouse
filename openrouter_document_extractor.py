@@ -3,7 +3,7 @@ import json
 import os
 import re
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 import requests
 from pydantic import ValidationError
@@ -29,6 +29,17 @@ from document_extraction_models import (
 class DocumentExtractionError(Exception):
     """Raised when a document cannot be parsed or validated for extraction."""
 
+    def __init__(
+        self,
+        message: str,
+        *,
+        raw_response_text: str | None = None,
+        raw_response_payload: Any = None,
+    ) -> None:
+        super().__init__(message)
+        self.raw_response_text = raw_response_text
+        self.raw_response_payload = raw_response_payload
+
 
 class OpenRouterDocumentExtractor:
     """
@@ -43,6 +54,7 @@ class OpenRouterDocumentExtractor:
         api_key: str | None = None,
         model: str = "openrouter/auto",
         max_document_chars: int = 35000,
+        request_timeout_seconds: float = 180.0,
     ) -> None:
         resolved_key = api_key or os.getenv("OPENROUTER_API_KEY")
         if not resolved_key:
@@ -53,10 +65,13 @@ class OpenRouterDocumentExtractor:
             raise ValueError("model must not be empty")
         if max_document_chars <= 0:
             raise ValueError("max_document_chars must be > 0")
+        if request_timeout_seconds <= 0:
+            raise ValueError("request_timeout_seconds must be > 0")
 
         self.api_key = resolved_key
         self.model = model.strip()
         self.max_document_chars = max_document_chars
+        self.request_timeout_seconds = float(request_timeout_seconds)
 
     def extract(
         self, document_path: str, extraction_types: list[ExtractionType]
@@ -69,11 +84,24 @@ class OpenRouterDocumentExtractor:
             raise DocumentExtractionError(f"Document path does not exist: {document_path}")
 
         payload = self._request_extraction_json(source, requested_types)
-        return self._build_result(
-            payload=payload,
-            document_path=document_path,
-            requested_types=requested_types,
-        )
+        try:
+            return self._build_result(
+                payload=payload,
+                document_path=document_path,
+                requested_types=requested_types,
+            )
+        except DocumentExtractionError as exc:
+            if exc.raw_response_payload is not None or exc.raw_response_text is not None:
+                raise
+            try:
+                payload_text = json.dumps(payload, ensure_ascii=True)
+            except Exception:
+                payload_text = None
+            raise DocumentExtractionError(
+                str(exc),
+                raw_response_text=payload_text,
+                raw_response_payload=payload,
+            ) from exc
 
     def extract_full_accounts(
         self, document_path: str, extraction_types: list[ExtractionType] | None = None
@@ -115,7 +143,13 @@ class OpenRouterDocumentExtractor:
         except Exception as exc:
             raise DocumentExtractionError(f"OpenRouter request failed: {exc}") from exc
 
-        response_text = self._response_text_from_completion(response)
+        try:
+            response_text = self._response_text_from_completion(response)
+        except DocumentExtractionError as exc:
+            raise DocumentExtractionError(
+                str(exc),
+                raw_response_payload=response,
+            ) from exc
         try:
             return self._parse_json_response(response_text)
         except DocumentExtractionError as exc:
@@ -123,7 +157,9 @@ class OpenRouterDocumentExtractor:
             snippet = compact[:400]
             raise DocumentExtractionError(
                 "OpenRouter response was not valid JSON "
-                f"(chars={len(response_text)} snippet={snippet!r})"
+                f"(chars={len(response_text)} snippet={snippet!r})",
+                raw_response_text=response_text,
+                raw_response_payload=response,
             ) from exc
 
     @staticmethod
@@ -576,7 +612,12 @@ class OpenRouterDocumentExtractor:
             "Content-Type": "application/json",
         }
         try:
-            response = requests.post(url, headers=headers, json=payload, timeout=180)
+            response = requests.post(
+                url,
+                headers=headers,
+                json=payload,
+                timeout=self.request_timeout_seconds,
+            )
         except requests.RequestException as exc:
             raise DocumentExtractionError(f"Request failed: {exc}") from exc
 
@@ -669,39 +710,65 @@ class OpenRouterDocumentExtractor:
             balance_sheet = self._parse_balance_sheet(raw_balance)
 
         if ExtractionType.Metadata in requested_types:
-            raw_metadata = payload.get("metadata")
-            metadata = self._parse_metadata(raw_metadata)
+            metadata = self._parse_optional_object_section(
+                payload=payload,
+                key="metadata",
+                section_label="metadata",
+                parser=self._parse_metadata,
+                warnings=validation_warnings,
+            )
 
         if ExtractionType.Governance in requested_types:
-            raw_governance = payload.get("governance")
-            governance = self._parse_governance(raw_governance)
+            governance = self._parse_optional_object_section(
+                payload=payload,
+                key="governance",
+                section_label="governance",
+                parser=self._parse_governance,
+                warnings=validation_warnings,
+            )
 
         if ExtractionType.StatementOfFinancialActivities in requested_types:
-            raw_sofa = payload.get("statement_of_financial_activities")
-            statement_of_financial_activities = self._parse_statement_of_financial_activities(
-                raw_sofa
+            statement_of_financial_activities = self._parse_optional_object_section(
+                payload=payload,
+                key="statement_of_financial_activities",
+                section_label="statement_of_financial_activities",
+                parser=self._parse_statement_of_financial_activities,
+                warnings=validation_warnings,
             )
 
         if ExtractionType.DetailedBalanceSheet in requested_types:
-            raw_detailed_balance_sheet = payload.get("detailed_balance_sheet")
-            detailed_balance_sheet = self._parse_detailed_balance_sheet(
-                raw_detailed_balance_sheet
+            detailed_balance_sheet = self._parse_optional_object_section(
+                payload=payload,
+                key="detailed_balance_sheet",
+                section_label="detailed_balance_sheet",
+                parser=self._parse_detailed_balance_sheet,
+                warnings=validation_warnings,
             )
 
         if ExtractionType.StaffingData in requested_types:
-            raw_staffing_data = payload.get("staffing_data")
-            staffing_data = self._parse_staffing_data(raw_staffing_data)
-
-        if ExtractionType.AcademyTrustAnnualReport in requested_types:
-            raw_annual_report = payload.get("academy_trust_annual_report")
-            academy_trust_annual_report = self._parse_academy_trust_annual_report(
-                raw_annual_report
+            staffing_data = self._parse_optional_object_section(
+                payload=payload,
+                key="staffing_data",
+                section_label="staffing_data",
+                parser=self._parse_staffing_data,
+                warnings=validation_warnings,
             )
 
-        validation_warnings = self._collect_validation_warnings(
-            statement_of_financial_activities=statement_of_financial_activities,
-            detailed_balance_sheet=detailed_balance_sheet,
-            academy_trust_annual_report=academy_trust_annual_report,
+        if ExtractionType.AcademyTrustAnnualReport in requested_types:
+            academy_trust_annual_report = self._parse_optional_object_section(
+                payload=payload,
+                key="academy_trust_annual_report",
+                section_label="academy_trust_annual_report",
+                parser=self._parse_academy_trust_annual_report,
+                warnings=validation_warnings,
+            )
+
+        validation_warnings.extend(
+            self._collect_validation_warnings(
+                statement_of_financial_activities=statement_of_financial_activities,
+                detailed_balance_sheet=detailed_balance_sheet,
+                academy_trust_annual_report=academy_trust_annual_report,
+            )
         )
 
         try:
@@ -721,6 +788,29 @@ class OpenRouterDocumentExtractor:
             )
         except ValidationError as exc:
             raise DocumentExtractionError(f"Invalid extraction result: {exc}") from exc
+
+    @staticmethod
+    def _parse_optional_object_section(
+        payload: dict[str, Any],
+        key: str,
+        section_label: str,
+        parser: Callable[[Any], Any],
+        warnings: list[str],
+    ) -> Any | None:
+        raw_value = payload.get(key)
+        if raw_value is None:
+            warnings.append(f"Section `{section_label}` missing/null; set to null.")
+            return None
+        if isinstance(raw_value, str) and not raw_value.strip():
+            warnings.append(f"Section `{section_label}` missing/null; set to null.")
+            return None
+        if not isinstance(raw_value, dict):
+            warnings.append(
+                f"Section `{section_label}` expected object but got "
+                f"{type(raw_value).__name__}; set to null."
+            )
+            return None
+        return parser(raw_value)
 
     @staticmethod
     def _collect_validation_warnings(
