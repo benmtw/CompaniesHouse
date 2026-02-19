@@ -3,6 +3,7 @@ import json
 import math
 import os
 import random
+import re
 import sqlite3
 import time
 import traceback
@@ -353,6 +354,7 @@ def _extract_with_model_fallback(
     extraction_types: list[ExtractionType],
     retries_on_invalid_json: int = 2,
     openrouter_timeout_seconds: float = 180.0,
+    openrouter_debug_dir: Path | None = None,
 ) -> tuple[dict[str, Any], list[str], str]:
     errors: list[str] = []
     for model in model_candidates:
@@ -363,6 +365,34 @@ def _extract_with_model_fallback(
                 model=model,
                 request_timeout_seconds=openrouter_timeout_seconds,
             )
+            if openrouter_debug_dir is not None:
+                # Persist full OpenRouter request/response artifacts for this exact model/attempt.
+                # This is intentionally verbose and includes file_data base64 so debugging can
+                # reconstruct the exact payload that was sent to the provider.
+                safe_model = re.sub(r"[^A-Za-z0-9._-]+", "_", model).strip("_") or "model"
+                attempt_dir = openrouter_debug_dir / f"{safe_model}_attempt{attempt}"
+                attempt_dir.mkdir(parents=True, exist_ok=True)
+                original_post = extractor._post_openrouter_chat_completion
+
+                def _capture_post(payload: dict[str, Any]) -> dict[str, Any]:
+                    # Full outbound payload (includes prompts, response_format, and file data URI).
+                    write_json(attempt_dir / "openrouter_request_payload.json", payload)
+                    # Convenience copy of just the schema body used for structured output.
+                    schema = (
+                        (payload.get("response_format") or {})
+                        .get("json_schema", {})
+                        .get("schema", {})
+                    )
+                    write_json(
+                        attempt_dir / "response_format.json_schema.schema.json",
+                        schema,
+                    )
+                    response = original_post(payload)
+                    # Raw provider response before text parsing / JSON parsing.
+                    write_json(attempt_dir / "raw_openrouter_response.json", response)
+                    return response
+
+                extractor._post_openrouter_chat_completion = _capture_post
             try:
                 result = extractor.extract(
                     document_path=document_path,
@@ -655,6 +685,15 @@ def build_parser() -> argparse.ArgumentParser:
         help="HTTP timeout for each OpenRouter extraction call in seconds (default 180)",
     )
     parser.add_argument(
+        "--write-openrouter-debug-artifacts",
+        action="store_true",
+        help=(
+            "Write full per-attempt OpenRouter request/response artifacts under "
+            "<run_dir>/<company>/extraction/openrouter_debug/. Includes full payload "
+            "(with file_data URI), extracted schema, and raw provider response."
+        ),
+    )
+    parser.add_argument(
         "--schema-profile",
         choices=["compact_single_call", "full_legacy", "light_core"],
         default=os.getenv("BATCH_SCHEMA_PROFILE", "compact_single_call"),
@@ -785,6 +824,11 @@ def main() -> int:
             run_id, args.openrouter_timeout_seconds
         )
     )
+    print(
+        "[run {}] write_openrouter_debug_artifacts={}".format(
+            run_id, args.write_openrouter_debug_artifacts
+        )
+    )
     print("[run {}] schema_profile={}".format(run_id, args.schema_profile))
     emit_event(
         "run_started",
@@ -798,6 +842,7 @@ def main() -> int:
         filing_history_items_per_page=args.filing_history_items_per_page,
         retries_on_invalid_json=args.retries_on_invalid_json,
         openrouter_timeout_seconds=args.openrouter_timeout_seconds,
+        write_openrouter_debug_artifacts=args.write_openrouter_debug_artifacts,
     )
 
     client = CompaniesHouseClient(api_key=ch_api_key)
@@ -918,6 +963,11 @@ def main() -> int:
 
             stage_start("openrouter_extract")
             try:
+                openrouter_debug_dir = (
+                    extraction_dir / "openrouter_debug"
+                    if args.write_openrouter_debug_artifacts
+                    else None
+                )
                 extraction_payload, warnings_payload, model_used = _extract_with_model_fallback(
                     api_key=openrouter_api_key,
                     model_candidates=model_candidates,
@@ -925,6 +975,7 @@ def main() -> int:
                     extraction_types=run_extraction_types,
                     retries_on_invalid_json=args.retries_on_invalid_json,
                     openrouter_timeout_seconds=args.openrouter_timeout_seconds,
+                    openrouter_debug_dir=openrouter_debug_dir,
                 )
             except DocumentExtractionError as exc:
                 if (
@@ -943,6 +994,7 @@ def main() -> int:
                         extraction_types=run_extraction_types,
                         retries_on_invalid_json=args.retries_on_invalid_json,
                         openrouter_timeout_seconds=args.openrouter_timeout_seconds,
+                        openrouter_debug_dir=openrouter_debug_dir,
                     )
                 else:
                     raise

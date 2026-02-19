@@ -391,6 +391,7 @@ Useful controls:
 - `--filing-history-items-per-page 100` fetches only the first filing-history page for latest full-accounts selection (faster and lower request volume)
 - `--retries-on-invalid-json 0` to disable same-model retries on malformed LLM JSON for faster high-volume runs
 - `--openrouter-timeout-seconds 60` to cap each OpenRouter extraction HTTP call at 1 minute (prevents long stalls on a single company)
+- `--write-openrouter-debug-artifacts` to persist full OpenRouter request/response artifacts per model attempt (includes full payload with file data URI, extracted schema body, and raw provider response)
 - `--schema-profile compact_single_call` (default) reduces schema nesting by removing duplicate deep annual-report branch from the request; `full_legacy` keeps prior full schema; `light_core` requests only lightweight sections.
 - Adaptive fallback: when `compact_single_call` fails with a provider schema-depth error, batch extraction automatically retries with `light_core` for that company only
 
@@ -402,6 +403,7 @@ Per-run output layout:
 - `output\trusts_extraction\run_<UTCSTAMP>\<company_number>\extraction\validation_warnings.json`
 - `output\trusts_extraction\run_<UTCSTAMP>\<company_number>\extraction\run_report.json`
 - On extraction failures with provider output available: `output\trusts_extraction\run_<UTCSTAMP>\<company_number>\extraction\raw_openrouter_response.json` and `raw_openrouter_response_text.txt`
+- Optional deep OpenRouter debug artifacts (when `--write-openrouter-debug-artifacts` is set): `output\trusts_extraction\run_<UTCSTAMP>\<company_number>\extraction\openrouter_debug\<model>_attemptN\openrouter_request_payload.json`, `response_format.json_schema.schema.json`, and `raw_openrouter_response.json`
 - Optional run summary: `output\trusts_extraction\run_<UTCSTAMP>\summary.json` (when `--write-summary-json` is set)
 - Structured debug timeline: `output\trusts_extraction\run_<UTCSTAMP>\events.jsonl` with per-company stage start/end events, durations, and failure context
 - Per-company summary entries now include `schema_profile` and `schema_profile_fallback_applied` to show when adaptive fallback was used
