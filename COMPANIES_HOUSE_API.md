@@ -241,11 +241,27 @@ Scripts already created in this repo:
 - `companieshouse_fetch.ps1` (end-to-end workflow)
 - `run_companieshouse.bat` (wrapper)
 - `batch_extract_trusts.py` (batch XLSX -> PDF + JSON + SQLite extraction pipeline)
+- `download_trusts_full_reports.py` (batch XLSX -> latest full-accounts PDF downloads only; no OpenRouter)
 
 Core Python modules:
 - `companies_house_client.py` (Companies House API client + compatibility exports)
 - `document_extraction_models.py` (extraction enums and Pydantic models)
 - `openrouter_document_extractor.py` (OpenRouter extraction implementation)
+
+Download-only run example (PowerShell):
+
+```powershell
+.\.venv\Scripts\python .\download_trusts_full_reports.py `
+  --input-xlsx "SourceData\allgroupslinksdata20260217\Trusts.xlsx" `
+  --random-sample-size 50 `
+  --random-seed 42 `
+  --write-summary-json
+```
+
+Notes:
+- Uses column `Companies House Number` from the first worksheet.
+- Downloads the latest full-accounts filing PDF per company.
+- Writes outputs under `output\trusts_documents_only\run_<UTCSTAMP>\`.
 
 Expected env variable:
 - `CH_API_KEY` (stored in `.env`)
