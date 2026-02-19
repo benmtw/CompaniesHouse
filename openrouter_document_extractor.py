@@ -7,6 +7,10 @@ from typing import Any
 
 import requests
 from pydantic import ValidationError
+try:
+    from json_repair import loads as json_repair_loads
+except ImportError:
+    json_repair_loads = None
 
 from document_extraction_models import (
     AcademyTrustAnnualReport,
@@ -112,7 +116,15 @@ class OpenRouterDocumentExtractor:
             raise DocumentExtractionError(f"OpenRouter request failed: {exc}") from exc
 
         response_text = self._response_text_from_completion(response)
-        return self._parse_json_response(response_text)
+        try:
+            return self._parse_json_response(response_text)
+        except DocumentExtractionError as exc:
+            compact = re.sub(r"\s+", " ", response_text).strip()
+            snippet = compact[:400]
+            raise DocumentExtractionError(
+                "OpenRouter response was not valid JSON "
+                f"(chars={len(response_text)} snippet={snippet!r})"
+            ) from exc
 
     @staticmethod
     def _build_prompts(requested_types: list[ExtractionType]) -> tuple[str, str]:
@@ -604,6 +616,15 @@ class OpenRouterDocumentExtractor:
                     return parsed
             except json.JSONDecodeError:
                 continue
+
+        if json_repair_loads is not None:
+            for candidate in candidates:
+                try:
+                    parsed = json_repair_loads(candidate, skip_json_loads=True)
+                    if isinstance(parsed, dict):
+                        return parsed
+                except Exception:
+                    continue
 
         raise DocumentExtractionError("OpenRouter response was not valid JSON")
 

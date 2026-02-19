@@ -908,6 +908,15 @@ class OpenRouterDocumentExtractorTests(unittest.TestCase):
         self.assertEqual(out["personnel_details"], [])
         self.assertEqual(out["balance_sheet"], [])
 
+    def test_parse_json_response_uses_repair_fallback_when_available(self):
+        content = "{personnel_details: [], balance_sheet: [],}"
+        repaired = {"personnel_details": [], "balance_sheet": []}
+        with patch("openrouter_document_extractor.json_repair_loads", return_value=repaired) as mocked:
+            out = OpenRouterDocumentExtractor._parse_json_response(content)
+        self.assertEqual(out["personnel_details"], [])
+        self.assertEqual(out["balance_sheet"], [])
+        mocked.assert_called()
+
 
 class CompaniesHouseLiveSmokeTest(unittest.TestCase):
     def test_live_list_documents_for_known_company(self):

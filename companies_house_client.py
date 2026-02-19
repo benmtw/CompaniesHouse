@@ -78,8 +78,8 @@ class CompaniesHouseClient:
         timeout: float = 30.0,
         public_base_url: str = "https://api.company-information.service.gov.uk",
         document_base_url: str = "https://document-api.company-information.service.gov.uk",
-        max_retries_on_429: int = 0,
-        retry_backoff_seconds: float = 5.0,
+        max_retries_on_429: int = 3,
+        retry_backoff_seconds: float = 10.0,
         respect_retry_after: bool = True,
     ) -> None:
         """Configure API auth/session and validate required runtime settings."""
