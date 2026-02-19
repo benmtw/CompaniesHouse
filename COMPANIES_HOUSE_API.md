@@ -242,6 +242,7 @@ Scripts already created in this repo:
 - `run_companieshouse.bat` (wrapper)
 - `batch_extract_trusts.py` (batch XLSX -> PDF + JSON + SQLite extraction pipeline)
 - `download_trusts_full_reports.py` (batch XLSX -> latest full-accounts PDF downloads only; no OpenRouter)
+- `companies_house_full_reports_extraction_pipeline.py` (decoupled CH download + OpenRouter extraction pipeline with separate worker pools and bounded queue)
 
 Core Python modules:
 - `companies_house_client.py` (Companies House API client + compatibility exports)
@@ -445,6 +446,90 @@ SQLite persistence:
 - Table `runs`: one row per batch run with counters and model metadata
 - Table `company_reports`: one row per company with status, document id, file paths, `model_used`, `pdf_size_bytes`, `approx_llm_tokens`, error text, and JSON payloads (`profile_json`, `filing_history_json`, `extraction_json`, `warnings_json`)
 - Batch extractor behavior: retries the same model up to 3 attempts total when OpenRouter returns non-JSON content, to reduce transient parse failures.
+
+## 12.1) Decoupled Full Reports Extraction Pipeline
+
+Purpose:
+- New script `companies_house_full_reports_extraction_pipeline.py` decouples Companies House download and OpenRouter extraction.
+- Separate worker pools are used:
+  - `--ch-workers` for CH download stage
+  - `--or-workers` for OpenRouter extraction stage
+- Shared global CH throttle applies across all CH requests from all threads using `--ch-min-request-interval-seconds`.
+- Bounded queue between stages (`--max-pending-extractions`) provides backpressure when extraction is slower.
+- Dedicated SQLite state DB/tables are used (`pipeline_runs`, `pipeline_jobs`), separate from legacy batch DB tables.
+
+Input contract:
+- XOR required:
+  - `--input-xlsx "<path-to-xlsx>"`
+  - `--company-numbers "09618502,08496504,..."`
+- If both or neither are supplied, the script fails fast.
+
+Modes:
+- `--mode all` (default): run CH download and extraction pipeline.
+- `--mode download`: CH download stage only; extraction marked skipped.
+- `--mode extract`: extraction stage only; local PDF lookup first, with optional CH fallback download if PDF is missing and `CH_API_KEY` is available.
+
+Auth requirements by mode:
+- `all`: requires `CH_API_KEY`, `OPENROUTER_API_KEY`, and `--model`/`OPENROUTER_MODEL`.
+- `download`: requires `CH_API_KEY`.
+- `extract`: requires `OPENROUTER_API_KEY` and `--model`/`OPENROUTER_MODEL`; `CH_API_KEY` is optional but needed for missing-PDF fallback.
+
+PowerShell examples:
+
+```powershell
+# all mode from company numbers
+.\.venv\Scripts\python .\companies_house_full_reports_extraction_pipeline.py `
+  --company-numbers "09618502,08496504,05670663" `
+  --mode all `
+  --ch-workers 2 `
+  --or-workers 4 `
+  --max-pending-extractions 100 `
+  --model "google/gemini-2.5-flash-lite" `
+  --write-summary-json
+
+# download-only mode from XLSX
+.\.venv\Scripts\python .\companies_house_full_reports_extraction_pipeline.py `
+  --input-xlsx "SourceData\allgroupslinksdata20260217\Trusts.xlsx" `
+  --mode download `
+  --ch-workers 2 `
+  --write-summary-json
+
+# extract-only mode (local docs first, CH fallback optional)
+.\.venv\Scripts\python .\companies_house_full_reports_extraction_pipeline.py `
+  --company-numbers "09618502,08496504" `
+  --mode extract `
+  --or-workers 4 `
+  --max-pending-extractions 100 `
+  --model "google/gemini-2.5-flash-lite" `
+  --write-summary-json
+```
+
+Key CLI flags:
+- `--output-root` (default `output\full_reports_extraction_pipeline`)
+- `--db-path` (default `<output-root>\full_reports_extraction_pipeline.db`)
+- `--start-index`, `--max-companies`, `--random-sample-size`, `--random-seed`
+- `--filing-history-items-per-page`
+- `--ch-min-request-interval-seconds`
+- `--fallback-models`
+- `--schema-profile`
+- `--retries-on-invalid-json`
+- `--openrouter-timeout-seconds`
+- `--write-openrouter-debug-artifacts`
+- `--write-summary-json`, `--summary-json-path`
+
+Per-run outputs:
+- `output\full_reports_extraction_pipeline\run_<UTCSTAMP>\events.jsonl`
+- `output\full_reports_extraction_pipeline\run_<UTCSTAMP>\<company>\api\profile.json`
+- `output\full_reports_extraction_pipeline\run_<UTCSTAMP>\<company>\api\filing_history.json`
+- `output\full_reports_extraction_pipeline\run_<UTCSTAMP>\<company>\documents\<company>_latest_full_accounts_<document_id>.pdf`
+- `output\full_reports_extraction_pipeline\run_<UTCSTAMP>\<company>\extraction\extraction_result.json`
+- `output\full_reports_extraction_pipeline\run_<UTCSTAMP>\<company>\extraction\validation_warnings.json`
+- `output\full_reports_extraction_pipeline\run_<UTCSTAMP>\<company>\extraction\run_report.json`
+- Optional summary: `output\full_reports_extraction_pipeline\run_<UTCSTAMP>\summary.json`
+
+SQLite persistence (new pipeline DB):
+- Table `pipeline_runs`: run config + counters + CH request count.
+- Table `pipeline_jobs`: per-company download/extract status, attempts, errors, file paths, model used, and final rollup status.
 
 ## 13) Smoke Test And Final Validation
 
