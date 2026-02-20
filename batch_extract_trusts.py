@@ -4,6 +4,7 @@ import math
 import os
 import random
 import re
+import shutil
 import sqlite3
 import time
 import traceback
@@ -21,6 +22,7 @@ from openrouter_document_extractor import DocumentExtractionError, OpenRouterDoc
 DEFAULT_INPUT_XLSX = "SourceData/allgroupslinksdata20260217/Trusts.xlsx"
 DEFAULT_OUTPUT_ROOT = "output/trusts_extraction"
 DEFAULT_DB_NAME = "companies_house_extractions.db"
+DEFAULT_CH_CACHE_DIR = "output/ch_document_cache"
 MAX_ERROR_TRACEBACK_CHARS = 4000
 
 
@@ -259,6 +261,44 @@ def _estimate_llm_tokens_for_pdf_bytes(pdf_size_bytes: int) -> int:
     if pdf_size_bytes <= 0:
         return 0
     return int(math.ceil(pdf_size_bytes / 4.0))
+
+
+def _resolve_cached_pdf_for_company(
+    company_number: str,
+    cache_dir: Path,
+    accept: str = "application/pdf",
+) -> tuple[Path | None, str | None]:
+    index_path = cache_dir / "cache_index.jsonl"
+    if not index_path.is_file():
+        return None, None
+
+    accept_normalized = accept.strip().lower()
+    candidates: list[tuple[Path, str | None]] = []
+    with index_path.open("r", encoding="utf-8") as fh:
+        for raw_line in fh:
+            line = raw_line.strip()
+            if not line:
+                continue
+            try:
+                payload = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+
+            if str(payload.get("company_number") or "").strip() != company_number:
+                continue
+            if str(payload.get("accept") or "").strip().lower() != accept_normalized:
+                continue
+
+            cache_path_raw = str(payload.get("cache_path") or "").strip()
+            if not cache_path_raw:
+                continue
+            document_id = str(payload.get("document_id") or "").strip() or None
+            candidates.append((Path(cache_path_raw), document_id))
+
+    for cache_path, document_id in reversed(candidates):
+        if cache_path.is_file() and cache_path.stat().st_size > 0:
+            return cache_path, document_id
+    return None, None
 
 
 def _is_full_accounts_filing(item: dict[str, Any]) -> bool:
@@ -930,37 +970,64 @@ def main() -> int:
         )
 
         try:
-            stage_start("get_company_profile")
-            profile = client.get_company_profile(company_number)
-            stage_end("ok")
-            stage_start("get_filing_history")
-            filing_history_page = client.get_filing_history(
-                company_number=company_number,
-                items_per_page=args.filing_history_items_per_page,
-                start_index=0,
-            )
-            filing_history = filing_history_page.get("items") or []
-            stage_end("ok", filing_items=len(filing_history))
-            stage_start("select_latest_full_accounts")
-            document_id = _latest_full_accounts_document_id_from_filing_history(filing_history)
-            if not document_id:
-                raise ValueError("No full accounts document found")
-            stage_end("ok", document_id=document_id)
-            summary_row["document_id"] = document_id
+            profile: dict[str, Any] = {}
+            filing_history: list[dict[str, Any]] = []
+            document_id: str | None = None
 
-            stage_start("download_document")
-            pdf_path = doc_dir / f"{company_number}_latest_full_accounts_{document_id}.pdf"
-            downloaded_path = client.download_document(
-                document_id=document_id,
-                output_path=str(pdf_path),
-                accept="application/pdf",
+            stage_start("resolve_cached_pdf")
+            cached_pdf_path, cached_document_id = _resolve_cached_pdf_for_company(
                 company_number=company_number,
+                cache_dir=Path(DEFAULT_CH_CACHE_DIR),
+                accept="application/pdf",
             )
-            stage_end(
-                "ok",
-                pdf_path=str(pdf_path),
-                cache_hit=client.last_download_cache_hit,
-            )
+            if cached_pdf_path is not None:
+                document_id = cached_document_id or "cache_unknown_docid"
+                pdf_path = doc_dir / f"{company_number}_latest_full_accounts_{document_id}.pdf"
+                if not pdf_path.exists() or pdf_path.stat().st_size == 0:
+                    shutil.copy2(cached_pdf_path, pdf_path)
+                downloaded_path = str(pdf_path)
+                stage_end(
+                    "ok",
+                    source="cache_index",
+                    cache_hit=True,
+                    document_id=document_id,
+                    pdf_path=str(pdf_path),
+                )
+            else:
+                stage_end("miss")
+
+                stage_start("get_company_profile")
+                profile = client.get_company_profile(company_number)
+                stage_end("ok")
+                stage_start("get_filing_history")
+                filing_history_page = client.get_filing_history(
+                    company_number=company_number,
+                    items_per_page=args.filing_history_items_per_page,
+                    start_index=0,
+                )
+                filing_history = filing_history_page.get("items") or []
+                stage_end("ok", filing_items=len(filing_history))
+                stage_start("select_latest_full_accounts")
+                document_id = _latest_full_accounts_document_id_from_filing_history(filing_history)
+                if not document_id:
+                    raise ValueError("No full accounts document found")
+                stage_end("ok", document_id=document_id)
+
+                stage_start("download_document")
+                pdf_path = doc_dir / f"{company_number}_latest_full_accounts_{document_id}.pdf"
+                downloaded_path = client.download_document(
+                    document_id=document_id,
+                    output_path=str(pdf_path),
+                    accept="application/pdf",
+                    company_number=company_number,
+                )
+                stage_end(
+                    "ok",
+                    pdf_path=str(pdf_path),
+                    cache_hit=client.last_download_cache_hit,
+                )
+
+            summary_row["document_id"] = document_id
             pdf_size_bytes = Path(downloaded_path).stat().st_size
             approx_llm_tokens = _estimate_llm_tokens_for_pdf_bytes(pdf_size_bytes)
             summary_row["pdf_path"] = str(pdf_path)

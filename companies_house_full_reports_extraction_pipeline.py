@@ -3,6 +3,7 @@ import json
 import os
 import queue
 import random
+import shutil
 import sqlite3
 import threading
 import time
@@ -32,6 +33,7 @@ DEFAULT_DB_NAME = "full_reports_extraction_pipeline.db"
 DEFAULT_CH_WORKERS = 2
 DEFAULT_OR_WORKERS = 4
 DEFAULT_MAX_PENDING_EXTRACTIONS = 100
+DEFAULT_CH_CACHE_DIR = "output/ch_document_cache"
 MAX_ERROR_TRACEBACK_CHARS = 4000
 
 
@@ -563,6 +565,64 @@ def _resolve_existing_pdf(output_root: Path, company_number: str) -> Path | None
     return sorted(candidates, key=lambda p: p.stat().st_mtime, reverse=True)[0]
 
 
+def _resolve_cached_pdf_for_company(
+    company_number: str,
+    cache_dir: Path,
+    accept: str = "application/pdf",
+) -> tuple[Path | None, str | None]:
+    index_path = cache_dir / "cache_index.jsonl"
+    if not index_path.is_file():
+        return None, None
+
+    accept_normalized = accept.strip().lower()
+    candidates: list[tuple[Path, str | None]] = []
+    with index_path.open("r", encoding="utf-8") as fh:
+        for raw_line in fh:
+            line = raw_line.strip()
+            if not line:
+                continue
+            try:
+                payload = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+
+            if str(payload.get("company_number") or "").strip() != company_number:
+                continue
+            if str(payload.get("accept") or "").strip().lower() != accept_normalized:
+                continue
+
+            cache_path_raw = str(payload.get("cache_path") or "").strip()
+            if not cache_path_raw:
+                continue
+            document_id = str(payload.get("document_id") or "").strip() or None
+            candidates.append((Path(cache_path_raw), document_id))
+
+    for cache_path, document_id in reversed(candidates):
+        if cache_path.is_file() and cache_path.stat().st_size > 0:
+            return cache_path, document_id
+    return None, None
+
+
+def _materialize_cached_pdf_into_run(
+    cache_path: Path,
+    run_dir: Path,
+    company_number: str,
+    document_id: str | None,
+) -> tuple[Path, str | None]:
+    doc_id = str(document_id or "").strip() or None
+    resolved_doc_id = doc_id or "cache_unknown_docid"
+    target = (
+        run_dir
+        / company_number
+        / "documents"
+        / f"{company_number}_latest_full_accounts_{resolved_doc_id}.pdf"
+    )
+    target.parent.mkdir(parents=True, exist_ok=True)
+    if not target.exists() or target.stat().st_size == 0:
+        shutil.copy2(cache_path, target)
+    return target, doc_id
+
+
 def _enqueue_with_backpressure(
     extraction_queue: queue.Queue[Any],
     payload: dict[str, Any],
@@ -828,6 +888,7 @@ def _extract_stage_worker_loop(
             seen_models.add(model)
 
     extraction_types = _extraction_types_for_schema_profile(args.schema_profile)
+    cache_dir = Path(DEFAULT_CH_CACHE_DIR)
 
     ch_client: CompaniesHouseClient | None = None
     if ch_api_key:
@@ -867,6 +928,47 @@ def _extract_stage_worker_loop(
                 resolved_pdf_path = Path(pdf_path)
             if resolved_pdf_path is None:
                 resolved_pdf_path = _resolve_existing_pdf(output_root, company_number)
+            if resolved_pdf_path is None:
+                cached_path, cached_document_id = _resolve_cached_pdf_for_company(
+                    company_number=company_number,
+                    cache_dir=cache_dir,
+                    accept="application/pdf",
+                )
+                if cached_path is not None:
+                    materialized_path, materialized_document_id = _materialize_cached_pdf_into_run(
+                        cache_path=cached_path,
+                        run_dir=run_dir,
+                        company_number=company_number,
+                        document_id=cached_document_id,
+                    )
+                    resolved_pdf_path = materialized_path
+                    if materialized_document_id:
+                        document_id = materialized_document_id
+                    db_writer.call(
+                        _update_download_state,
+                        db_writer.conn,
+                        run_id,
+                        job_index,
+                        "success",
+                        {
+                            "download_ended_at": _utc_now_precise(),
+                            "document_id": document_id,
+                            "pdf_path": str(materialized_path),
+                            "cache_hit": 1,
+                            "pdf_size_bytes": int(materialized_path.stat().st_size),
+                            "download_error": None,
+                        },
+                    )
+                    emit_event(
+                        "job_download_end",
+                        job_index=job_index,
+                        company_number=company_number,
+                        status="success",
+                        document_id=document_id,
+                        cache_hit=True,
+                        pdf_path=str(materialized_path),
+                        source="cache_index",
+                    )
             if resolved_pdf_path is None:
                 if ch_client is None:
                     raise ValueError(

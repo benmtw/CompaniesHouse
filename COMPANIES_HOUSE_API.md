@@ -276,6 +276,7 @@ Document cache behavior (default enabled in `CompaniesHouseClient`):
 - On cache miss: document is downloaded once, atomically persisted to cache, then copied to `output_path`.
 - Empty/corrupt cache files (zero bytes) are treated as misses and re-downloaded.
 - Cross-process lock files are used to avoid duplicate downloads for the same document (`.lock` sidecar per cache file).
+- `batch_extract_trusts.py` now consults `cache_index.jsonl` first per company in the extraction loop; if a cached PDF is found, it skips CH profile/filing-history calls for that company.
 
 Client cache configuration:
 - `cache_enabled=True`
@@ -439,6 +440,7 @@ Per-run output layout:
 - Optional run summary: `output\trusts_extraction\run_<UTCSTAMP>\summary.json` (when `--write-summary-json` is set)
 - Structured debug timeline: `output\trusts_extraction\run_<UTCSTAMP>\events.jsonl` with per-company stage start/end events, durations, and failure context
 - `download_document` stage end events include `cache_hit` (`true`/`false`) to show whether document bytes came from local cache
+- `resolve_cached_pdf` stage checks `output\ch_document_cache\cache_index.jsonl` before any CH API calls; a hit materializes the PDF directly into the run folder.
 - Per-company summary entries now include `schema_profile` and `schema_profile_fallback_applied` to show when adaptive fallback was used
 
 SQLite persistence:
@@ -467,7 +469,7 @@ Input contract:
 Modes:
 - `--mode all` (default): run CH download and extraction pipeline.
 - `--mode download`: CH download stage only; extraction marked skipped.
-- `--mode extract`: extraction stage only; local PDF lookup first, with optional CH fallback download if PDF is missing and `CH_API_KEY` is available.
+- `--mode extract`: extraction stage only; lookup order is local run PDF under `--output-root`, then cache-index lookup in `output\ch_document_cache\cache_index.jsonl`, then optional CH fallback download if still missing and `CH_API_KEY` is available.
 
 Auth requirements by mode:
 - `all`: requires `CH_API_KEY`, `OPENROUTER_API_KEY`, and `--model`/`OPENROUTER_MODEL`.
