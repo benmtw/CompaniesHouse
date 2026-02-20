@@ -486,7 +486,7 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--schema-profile",
-        choices=["compact_single_call", "full_legacy", "light_core"],
+        choices=["compact_single_call", "full_legacy", "light_core", "personnel_only"],
         default=os.getenv("BATCH_SCHEMA_PROFILE", "compact_single_call"),
     )
     parser.add_argument("--retries-on-invalid-json", type=int, default=2)

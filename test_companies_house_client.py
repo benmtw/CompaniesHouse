@@ -10,6 +10,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import Mock, patch
 
+from batch_extract_trusts import _extraction_types_for_schema_profile
 from companies_house_full_reports_extraction_pipeline import (
     GlobalCHThrottle,
     _create_tables,
@@ -1134,6 +1135,10 @@ class OpenRouterDocumentExtractorTests(unittest.TestCase):
 
 
 class FullReportsExtractionPipelineTests(unittest.TestCase):
+    def test_schema_profile_personnel_only_maps_to_personnel_details(self):
+        types = _extraction_types_for_schema_profile("personnel_only")
+        self.assertEqual(types, [ExtractionType.PersonnelDetails])
+
     def test_parse_company_numbers_csv_normalizes_and_dedupes(self):
         parsed = _parse_company_numbers_csv(" 9618502,09618502, ABC, 08496504 ,")
         self.assertEqual(parsed, ["09618502", "08496504"])

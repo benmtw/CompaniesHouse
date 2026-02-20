@@ -424,7 +424,7 @@ Useful controls:
 - `--retries-on-invalid-json 0` to disable same-model retries on malformed LLM JSON for faster high-volume runs
 - `--openrouter-timeout-seconds 60` to cap each OpenRouter extraction HTTP call at 1 minute (prevents long stalls on a single company)
 - `--write-openrouter-debug-artifacts` to persist full OpenRouter request/response artifacts per model attempt (includes full payload with file data URI, extracted schema body, and raw provider response)
-- `--schema-profile compact_single_call` (default) reduces schema nesting by removing duplicate deep annual-report branch from the request; `full_legacy` keeps prior full schema; `light_core` requests only lightweight sections.
+- `--schema-profile compact_single_call` (default) reduces schema nesting by removing duplicate deep annual-report branch from the request; `full_legacy` keeps prior full schema; `light_core` requests only lightweight sections; `personnel_only` requests only `PersonnelDetails`.
 - Adaptive fallback: when `compact_single_call` fails with a provider schema-depth error, batch extraction automatically retries with `light_core` for that company only
 
 Per-run output layout:
@@ -512,6 +512,7 @@ Key CLI flags:
 - `--ch-min-request-interval-seconds`
 - `--fallback-models`
 - `--schema-profile`
+  - Supported values: `compact_single_call`, `full_legacy`, `light_core`, `personnel_only`
 - `--retries-on-invalid-json`
 - `--openrouter-timeout-seconds`
 - `--write-openrouter-debug-artifacts`

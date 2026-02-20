@@ -319,6 +319,10 @@ def _extraction_types_for_schema_profile(schema_profile: str) -> list[Extraction
             ExtractionType.Metadata,
             ExtractionType.Governance,
         ]
+    if schema_profile == "personnel_only":
+        return [
+            ExtractionType.PersonnelDetails,
+        ]
     raise ValueError(f"Unsupported schema_profile: {schema_profile}")
 
 
@@ -695,11 +699,12 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--schema-profile",
-        choices=["compact_single_call", "full_legacy", "light_core"],
+        choices=["compact_single_call", "full_legacy", "light_core", "personnel_only"],
         default=os.getenv("BATCH_SCHEMA_PROFILE", "compact_single_call"),
         help=(
             "Extraction schema profile. "
-            "compact_single_call minimizes nesting while keeping broad coverage."
+            "compact_single_call minimizes nesting while keeping broad coverage. "
+            "personnel_only requests only PersonnelDetails."
         ),
     )
     return parser
