@@ -9,23 +9,28 @@ import threading
 import time
 import traceback
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
-from batch_extract_trusts import (
-    _derive_annual_report_from_component_sections,
-    _extract_with_model_fallback,
-    _extraction_types_for_schema_profile,
-    _latest_full_accounts_document_id_from_filing_history,
-    _load_dotenv_file,
-    _parse_fallback_models,
+from companies_house_client import CompaniesHouseClient
+from pipeline_shared import (
+    add_common_extraction_cli_args,
+    derive_annual_report_from_component_sections,
+    extract_with_model_fallback,
+    extraction_types_for_schema_profile,
+    install_request_throttle,
+    latest_full_accounts_document_id_from_filing_history,
+    load_dotenv_file,
     normalize_company_number,
+    parse_fallback_models,
     read_xlsx_rows,
+    resolve_cached_pdf_for_company,
+    utc_now,
+    utc_now_precise,
     write_json,
 )
-from companies_house_client import CompaniesHouseClient
 
 
 DEFAULT_OUTPUT_ROOT = "output/full_reports_extraction_pipeline"
@@ -41,20 +46,29 @@ MAX_ERROR_TRACEBACK_CHARS = 4000
 class GlobalCHThrottle:
     min_interval_seconds: float
     lock: threading.Lock
-    last_request_ts: float = 0.0
-    request_count: int = 0
+    state: dict[str, Any] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        self.state.setdefault("enabled", self.min_interval_seconds > 0)
+        self.state.setdefault("min_interval_seconds", self.min_interval_seconds)
+        self.state.setdefault("last_request_ts", 0.0)
+        self.state.setdefault("request_count", 0)
 
     @property
     def enabled(self) -> bool:
         return self.min_interval_seconds > 0
 
+    @property
+    def request_count(self) -> int:
+        return int(self.state.get("request_count", 0))
+
 
 def _utc_now() -> str:
-    return datetime.now(UTC).replace(microsecond=0).isoformat()
+    return utc_now()
 
 
 def _utc_now_precise() -> str:
-    return datetime.now(UTC).isoformat(timespec="milliseconds")
+    return utc_now_precise()
 
 
 def _append_jsonl_locked(path: Path, payload: dict[str, Any], lock: threading.Lock) -> None:
@@ -99,22 +113,12 @@ def _install_global_throttle_on_client(
     client: CompaniesHouseClient,
     shared_throttle: GlobalCHThrottle,
 ) -> None:
-    if not shared_throttle.enabled:
-        return
-    original_request = client.session.request
-
-    def throttled_request(*args: Any, **kwargs: Any) -> Any:
-        with shared_throttle.lock:
-            now = time.monotonic()
-            elapsed = now - shared_throttle.last_request_ts
-            wait = shared_throttle.min_interval_seconds - elapsed
-            if wait > 0:
-                time.sleep(wait)
-            shared_throttle.last_request_ts = time.monotonic()
-            shared_throttle.request_count += 1
-        return original_request(*args, **kwargs)
-
-    client.session.request = throttled_request
+    install_request_throttle(
+        client=client,
+        min_interval_seconds=shared_throttle.min_interval_seconds,
+        lock=shared_throttle.lock,
+        shared_state=shared_throttle.state,
+    )
 
 
 def _create_tables(conn: sqlite3.Connection) -> None:
@@ -458,12 +462,6 @@ def _build_parser() -> argparse.ArgumentParser:
         default="all",
         help="Pipeline mode: all, download-only, or extract-only",
     )
-    parser.add_argument("--output-root", default=DEFAULT_OUTPUT_ROOT)
-    parser.add_argument(
-        "--db-path",
-        default="",
-        help="SQLite file path (defaults to <output-root>/full_reports_extraction_pipeline.db)",
-    )
     parser.add_argument("--ch-workers", type=int, default=DEFAULT_CH_WORKERS)
     parser.add_argument("--or-workers", type=int, default=DEFAULT_OR_WORKERS)
     parser.add_argument(
@@ -471,35 +469,11 @@ def _build_parser() -> argparse.ArgumentParser:
         type=int,
         default=DEFAULT_MAX_PENDING_EXTRACTIONS,
     )
-    parser.add_argument("--start-index", type=int, default=0)
-    parser.add_argument("--max-companies", type=int, default=0)
-    parser.add_argument("--random-sample-size", type=int, default=0)
-    parser.add_argument("--random-seed", type=int, default=0)
-    parser.add_argument("--filing-history-items-per-page", type=int, default=100)
-    parser.add_argument(
-        "--ch-min-request-interval-seconds",
-        type=float,
-        default=float(os.getenv("CH_MIN_REQUEST_INTERVAL_SECONDS", "2.0")),
+    add_common_extraction_cli_args(
+        parser,
+        output_root_default=DEFAULT_OUTPUT_ROOT,
+        db_help="SQLite file path (defaults to <output-root>/full_reports_extraction_pipeline.db)",
     )
-    parser.add_argument("--model", default=os.getenv("OPENROUTER_MODEL", "").strip())
-    parser.add_argument(
-        "--fallback-models",
-        default=os.getenv("OPENROUTER_FALLBACK_MODELS", ""),
-    )
-    parser.add_argument(
-        "--schema-profile",
-        choices=["compact_single_call", "full_legacy", "light_core", "personnel_only"],
-        default=os.getenv("BATCH_SCHEMA_PROFILE", "compact_single_call"),
-    )
-    parser.add_argument("--retries-on-invalid-json", type=int, default=2)
-    parser.add_argument(
-        "--openrouter-timeout-seconds",
-        type=float,
-        default=float(os.getenv("OPENROUTER_TIMEOUT_SECONDS", "180")),
-    )
-    parser.add_argument("--write-openrouter-debug-artifacts", action="store_true")
-    parser.add_argument("--write-summary-json", action="store_true")
-    parser.add_argument("--summary-json-path", default="")
     return parser
 
 
@@ -570,37 +544,11 @@ def _resolve_cached_pdf_for_company(
     cache_dir: Path,
     accept: str = "application/pdf",
 ) -> tuple[Path | None, str | None]:
-    index_path = cache_dir / "cache_index.jsonl"
-    if not index_path.is_file():
-        return None, None
-
-    accept_normalized = accept.strip().lower()
-    candidates: list[tuple[Path, str | None]] = []
-    with index_path.open("r", encoding="utf-8") as fh:
-        for raw_line in fh:
-            line = raw_line.strip()
-            if not line:
-                continue
-            try:
-                payload = json.loads(line)
-            except json.JSONDecodeError:
-                continue
-
-            if str(payload.get("company_number") or "").strip() != company_number:
-                continue
-            if str(payload.get("accept") or "").strip().lower() != accept_normalized:
-                continue
-
-            cache_path_raw = str(payload.get("cache_path") or "").strip()
-            if not cache_path_raw:
-                continue
-            document_id = str(payload.get("document_id") or "").strip() or None
-            candidates.append((Path(cache_path_raw), document_id))
-
-    for cache_path, document_id in reversed(candidates):
-        if cache_path.is_file() and cache_path.stat().st_size > 0:
-            return cache_path, document_id
-    return None, None
+    return resolve_cached_pdf_for_company(
+        company_number=company_number,
+        cache_dir=cache_dir,
+        accept=accept,
+    )
 
 
 def _materialize_cached_pdf_into_run(
@@ -735,7 +683,7 @@ def _download_stage_worker(
         write_json(api_dir / "profile.json", profile)
         write_json(api_dir / "filing_history.json", filings)
 
-        document_id = _latest_full_accounts_document_id_from_filing_history(filings)
+        document_id = latest_full_accounts_document_id_from_filing_history(filings)
         if not document_id:
             raise ValueError("No full accounts document found")
 
@@ -853,7 +801,7 @@ def _download_company_fallback_for_extract(
     write_json(api_dir / "profile.json", profile)
     write_json(api_dir / "filing_history.json", filings)
 
-    document_id = _latest_full_accounts_document_id_from_filing_history(filings)
+    document_id = latest_full_accounts_document_id_from_filing_history(filings)
     if not document_id:
         raise ValueError("No full accounts document found")
 
@@ -879,7 +827,7 @@ def _extract_stage_worker_loop(
     emit_event: Any,
     db_writer: _DBWriter,
 ) -> None:
-    model_candidates = [args.model] + _parse_fallback_models(args.fallback_models)
+    model_candidates = [args.model] + parse_fallback_models(args.fallback_models)
     deduped_models: list[str] = []
     seen_models: set[str] = set()
     for model in model_candidates:
@@ -887,7 +835,7 @@ def _extract_stage_worker_loop(
             deduped_models.append(model)
             seen_models.add(model)
 
-    extraction_types = _extraction_types_for_schema_profile(args.schema_profile)
+    extraction_types = extraction_types_for_schema_profile(args.schema_profile)
     cache_dir = Path(DEFAULT_CH_CACHE_DIR)
 
     ch_client: CompaniesHouseClient | None = None
@@ -1005,7 +953,7 @@ def _extract_stage_worker_loop(
                 if args.write_openrouter_debug_artifacts
                 else None
             )
-            extraction_payload, warnings_payload, model_used = _extract_with_model_fallback(
+            extraction_payload, warnings_payload, model_used = extract_with_model_fallback(
                 api_key=openrouter_api_key,
                 model_candidates=deduped_models,
                 document_path=str(resolved_pdf_path),
@@ -1015,7 +963,7 @@ def _extract_stage_worker_loop(
                 openrouter_debug_dir=openrouter_debug_dir,
             )
             if extraction_payload.get("academy_trust_annual_report") is None:
-                derived = _derive_annual_report_from_component_sections(extraction_payload)
+                derived = derive_annual_report_from_component_sections(extraction_payload)
                 if derived is not None:
                     extraction_payload["academy_trust_annual_report"] = derived
 
@@ -1102,7 +1050,7 @@ def _extract_stage_worker_loop(
 
 
 def main() -> int:
-    _load_dotenv_file(Path(".env"))
+    load_dotenv_file(Path(".env"))
     args = _build_parser().parse_args()
 
     if args.start_index < 0:
@@ -1150,7 +1098,7 @@ def main() -> int:
             "input_source_value": source_value,
             "output_run_dir": str(run_dir),
             "model": args.model,
-            "fallback_models_json": json.dumps(_parse_fallback_models(args.fallback_models)),
+            "fallback_models_json": json.dumps(parse_fallback_models(args.fallback_models)),
             "schema_profile": args.schema_profile,
             "ch_workers": args.ch_workers,
             "or_workers": args.or_workers,
