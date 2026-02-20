@@ -65,13 +65,23 @@ class PersonnelDetail(BaseModel):
     first_name: str
     last_name: str
     job_title: str
+    organisation_name: str
+    organisation_type: str
 
-    @field_validator("first_name", "last_name", "job_title")
+    @field_validator("first_name", "last_name", "job_title", "organisation_name")
     @classmethod
     def _required_non_empty(cls, value: str) -> str:
         cleaned = str(value).strip()
         if not cleaned:
             raise ValueError("must not be empty")
+        return cleaned
+
+    @field_validator("organisation_type")
+    @classmethod
+    def _organisation_type_must_be_supported(cls, value: str) -> str:
+        cleaned = str(value).strip().lower()
+        if cleaned not in {"trust", "school"}:
+            raise ValueError("must be either 'trust' or 'school'")
         return cleaned
 
 
@@ -132,9 +142,12 @@ class Metadata(BaseModel):
     @field_validator("company_registration_number")
     @classmethod
     def _company_number_must_be_8_digits(cls, value: str) -> str:
-        if len(value) != 8 or not value.isdigit():
+        normalized = value.strip()
+        if normalized.isdigit() and len(normalized) == 7:
+            normalized = normalized.zfill(8)
+        if len(normalized) != 8 or not normalized.isdigit():
             raise ValueError("must be an 8-digit company number")
-        return value
+        return normalized
 
 
 class TrusteeAttendance(BaseModel):

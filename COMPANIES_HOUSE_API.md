@@ -12,6 +12,22 @@ Source files used:
 - `Document API_ Fetch a document's metadata.html`
 - `Document API_ Fetch a document.html`
 
+## IMPORTANT: Extraction Profile Accuracy Note (February 20, 2026)
+
+For personnel extraction quality, use `schema-profile personnel_only` when personnel completeness matters.
+
+Measured result from first 100 trusts in `SourceData/allgroupslinksdata20260217/Trusts.xlsx`:
+- Baseline run (`personnel_only`): `output/trusts_extraction/run_20260220T121541Z`
+- Comparison run (`light_core`): `output/trusts_extraction/run_20260220T122713Z`
+- Both runs succeeded for 84 trusts (comparable set).
+- Exact personnel match: 7/84 trusts.
+- Raw personnel rows returned: `personnel_only=2258`, `light_core=1224` (54.2% retained by `light_core`).
+- Outlier-trimmed (drop top 5% largest absolute trust-level deltas: 4 trusts): `personnel_only=1814`, `light_core=1178` (64.9% retained by `light_core`).
+- Median personnel rows per trust (both-success set): `personnel_only=21`, `light_core=9`.
+
+Conclusion: requesting broader output with `light_core` substantially reduced personnel completeness in this test, even after excluding outliers.
+Model scope note: this observation is from runs using `google/gemini-2.5-flash-lite` only; behavior may differ with other models, so do not generalize without model-specific validation.
+
 ## 0) Live Reference Notes (from developer-specs site)
 
 Visited links:
@@ -241,14 +257,47 @@ Scripts already created in this repo:
 - `companieshouse_fetch.ps1` (end-to-end workflow)
 - `run_companieshouse.bat` (wrapper)
 - `batch_extract_trusts.py` (batch XLSX -> PDF + JSON + SQLite extraction pipeline)
+- `download_trusts_full_reports.py` (batch XLSX -> latest full-accounts PDF downloads only; no OpenRouter)
+- `companies_house_full_reports_extraction_pipeline.py` (decoupled CH download + OpenRouter extraction pipeline with separate worker pools and bounded queue)
 
 Core Python modules:
 - `companies_house_client.py` (Companies House API client + compatibility exports)
 - `document_extraction_models.py` (extraction enums and Pydantic models)
 - `openrouter_document_extractor.py` (OpenRouter extraction implementation)
 
+Download-only run example (PowerShell):
+
+```powershell
+.\.venv\Scripts\python .\download_trusts_full_reports.py `
+  --input-xlsx "SourceData\allgroupslinksdata20260217\Trusts.xlsx" `
+  --random-sample-size 50 `
+  --random-seed 42 `
+  --write-summary-json
+```
+
+Notes:
+- Uses column `Companies House Number` from the first worksheet.
+- Downloads the latest full-accounts filing PDF per company.
+- Writes outputs under `output\trusts_documents_only\run_<UTCSTAMP>\`.
+
 Expected env variable:
 - `CH_API_KEY` (stored in `.env`)
+
+Document cache behavior (default enabled in `CompaniesHouseClient`):
+- `download_document(...)` is cache-first and keyed by immutable `document_id` + `Accept` media type.
+- Default cache root: `output\ch_document_cache`
+- Cache key layout: `output\ch_document_cache\<accept_sanitized>\<document_id>.bin`
+- Optional reverse index: `output\ch_document_cache\cache_index.jsonl` (written when `company_number` is passed to `download_document(...)`)
+- On cache hit: no Companies House download request is sent; cached bytes are copied to requested `output_path`.
+- On cache miss: document is downloaded once, atomically persisted to cache, then copied to `output_path`.
+- Empty/corrupt cache files (zero bytes) are treated as misses and re-downloaded.
+- Cross-process lock files are used to avoid duplicate downloads for the same document (`.lock` sidecar per cache file).
+- `batch_extract_trusts.py` now consults `cache_index.jsonl` first per company in the extraction loop; if a cached PDF is found, it skips CH profile/filing-history calls for that company.
+
+Client cache configuration:
+- `cache_enabled=True`
+- `cache_dir=\"output/ch_document_cache\"`
+- `cache_lock_timeout_seconds=30.0`
 
 ## 10) Cleanup Guidance
 
@@ -279,7 +328,7 @@ Current extraction behavior:
 - `extract_latest_full_accounts(...)` selects the latest `FilingDocumentType.FULL_ACCOUNTS` document only for retrieval.
 - `extract_latest_mat_annual_report(...)` is a convenience wrapper that calls `extract_latest_full_accounts(...)` with `ExtractionType.AcademyTrustAnnualReport`.
 - Extraction itself is requested independently via `ExtractionType` (you can pass one or many):
-  - `ExtractionType.PersonnelDetails` -> `personnel_details[]`
+  - `ExtractionType.PersonnelDetails` -> `personnel_details[]` with `first_name`, `last_name`, `job_title`, `organisation_name`, `organisation_type` (`trust`/`school`)
   - `ExtractionType.BalanceSheet` -> legacy `balance_sheet[]` line-item output
   - `ExtractionType.Metadata` -> `metadata`
   - `ExtractionType.Governance` -> `governance`
@@ -390,7 +439,11 @@ Useful controls:
 - `--summary-json-path "<path>"` optional explicit location for summary JSON
 - `--filing-history-items-per-page 100` fetches only the first filing-history page for latest full-accounts selection (faster and lower request volume)
 - `--retries-on-invalid-json 0` to disable same-model retries on malformed LLM JSON for faster high-volume runs
-- `--schema-profile compact_single_call` (default) reduces schema nesting by removing duplicate deep annual-report branch from the request; `full_legacy` keeps prior full schema; `light_core` requests only lightweight sections.
+- `--openrouter-timeout-seconds 60` to cap each OpenRouter extraction HTTP call at 1 minute (prevents long stalls on a single company)
+- `--write-openrouter-debug-artifacts` to persist full OpenRouter request/response artifacts per model attempt (includes full payload with file data URI, extracted schema body, and raw provider response)
+- `--schema-profile compact_single_call` (default) reduces schema nesting by removing duplicate deep annual-report branch from the request; `full_legacy` keeps prior full schema; `light_core` requests only lightweight sections; `personnel_only` requests only `PersonnelDetails`.
+- Personnel extraction guardrails: `personnel_only` excludes `Member`/`Trustee` roles and excludes rows marked as no longer current (for example `resigned`, `left`, `to <date>`, `until <date>`, `former`).
+- Personnel extraction now classifies each retained row with `organisation_type` (`trust`/`school`) and `organisation_name` (specific school where present, otherwise trust-level entity).
 - Adaptive fallback: when `compact_single_call` fails with a provider schema-depth error, batch extraction automatically retries with `light_core` for that company only
 
 Per-run output layout:
@@ -400,7 +453,12 @@ Per-run output layout:
 - `output\trusts_extraction\run_<UTCSTAMP>\<company_number>\extraction\extraction_result.json`
 - `output\trusts_extraction\run_<UTCSTAMP>\<company_number>\extraction\validation_warnings.json`
 - `output\trusts_extraction\run_<UTCSTAMP>\<company_number>\extraction\run_report.json`
+- On extraction failures with provider output available: `output\trusts_extraction\run_<UTCSTAMP>\<company_number>\extraction\raw_openrouter_response.json` and `raw_openrouter_response_text.txt`
+- Optional deep OpenRouter debug artifacts (when `--write-openrouter-debug-artifacts` is set): `output\trusts_extraction\run_<UTCSTAMP>\<company_number>\extraction\openrouter_debug\<model>_attemptN\openrouter_request_payload.json`, `response_format.json_schema.schema.json`, and `raw_openrouter_response.json`
 - Optional run summary: `output\trusts_extraction\run_<UTCSTAMP>\summary.json` (when `--write-summary-json` is set)
+- Structured debug timeline: `output\trusts_extraction\run_<UTCSTAMP>\events.jsonl` with per-company stage start/end events, durations, and failure context
+- `download_document` stage end events include `cache_hit` (`true`/`false`) to show whether document bytes came from local cache
+- `resolve_cached_pdf` stage checks `output\ch_document_cache\cache_index.jsonl` before any CH API calls; a hit materializes the PDF directly into the run folder.
 - Per-company summary entries now include `schema_profile` and `schema_profile_fallback_applied` to show when adaptive fallback was used
 
 SQLite persistence:
@@ -408,6 +466,91 @@ SQLite persistence:
 - Table `runs`: one row per batch run with counters and model metadata
 - Table `company_reports`: one row per company with status, document id, file paths, `model_used`, `pdf_size_bytes`, `approx_llm_tokens`, error text, and JSON payloads (`profile_json`, `filing_history_json`, `extraction_json`, `warnings_json`)
 - Batch extractor behavior: retries the same model up to 3 attempts total when OpenRouter returns non-JSON content, to reduce transient parse failures.
+
+## 12.1) Decoupled Full Reports Extraction Pipeline
+
+Purpose:
+- New script `companies_house_full_reports_extraction_pipeline.py` decouples Companies House download and OpenRouter extraction.
+- Separate worker pools are used:
+  - `--ch-workers` for CH download stage
+  - `--or-workers` for OpenRouter extraction stage
+- Shared global CH throttle applies across all CH requests from all threads/processes using `--ch-min-request-interval-seconds` (including Parsl HTEX workers).
+- Bounded queue between stages (`--max-pending-extractions`) provides backpressure when extraction is slower.
+- Dedicated SQLite state DB/tables are used (`pipeline_runs`, `pipeline_jobs`), separate from legacy batch DB tables.
+
+Input contract:
+- XOR required:
+  - `--input-xlsx "<path-to-xlsx>"`
+  - `--company-numbers "09618502,08496504,..."`
+- If both or neither are supplied, the script fails fast.
+
+Modes:
+- `--mode all` (default): run CH download and extraction pipeline.
+- `--mode download`: CH download stage only; extraction marked skipped.
+- `--mode extract`: extraction stage only; lookup order is local run PDF under `--output-root`, then cache-index lookup in `output\ch_document_cache\cache_index.jsonl`, then optional CH fallback download if still missing and `CH_API_KEY` is available.
+
+Auth requirements by mode:
+- `all`: requires `CH_API_KEY`, `OPENROUTER_API_KEY`, and `--model`/`OPENROUTER_MODEL`.
+- `download`: requires `CH_API_KEY`.
+- `extract`: requires `OPENROUTER_API_KEY` and `--model`/`OPENROUTER_MODEL`; `CH_API_KEY` is optional but needed for missing-PDF fallback.
+
+PowerShell examples:
+
+```powershell
+# all mode from company numbers
+.\.venv\Scripts\python .\companies_house_full_reports_extraction_pipeline.py `
+  --company-numbers "09618502,08496504,05670663" `
+  --mode all `
+  --ch-workers 2 `
+  --or-workers 4 `
+  --max-pending-extractions 100 `
+  --model "google/gemini-2.5-flash-lite" `
+  --write-summary-json
+
+# download-only mode from XLSX
+.\.venv\Scripts\python .\companies_house_full_reports_extraction_pipeline.py `
+  --input-xlsx "SourceData\allgroupslinksdata20260217\Trusts.xlsx" `
+  --mode download `
+  --ch-workers 2 `
+  --write-summary-json
+
+# extract-only mode (local docs first, CH fallback optional)
+.\.venv\Scripts\python .\companies_house_full_reports_extraction_pipeline.py `
+  --company-numbers "09618502,08496504" `
+  --mode extract `
+  --or-workers 4 `
+  --max-pending-extractions 100 `
+  --model "google/gemini-2.5-flash-lite" `
+  --write-summary-json
+```
+
+Key CLI flags:
+- `--output-root` (default `output\full_reports_extraction_pipeline`)
+- `--db-path` (default `<output-root>\full_reports_extraction_pipeline.db`)
+- `--start-index`, `--max-companies`, `--random-sample-size`, `--random-seed`
+- `--filing-history-items-per-page`
+- `--ch-min-request-interval-seconds`
+- `--fallback-models`
+- `--schema-profile`
+  - Supported values: `compact_single_call`, `full_legacy`, `light_core`, `personnel_only`
+- `--retries-on-invalid-json`
+- `--openrouter-timeout-seconds`
+- `--write-openrouter-debug-artifacts`
+- `--write-summary-json`, `--summary-json-path`
+
+Per-run outputs:
+- `output\full_reports_extraction_pipeline\run_<UTCSTAMP>\events.jsonl`
+- `output\full_reports_extraction_pipeline\run_<UTCSTAMP>\<company>\api\profile.json`
+- `output\full_reports_extraction_pipeline\run_<UTCSTAMP>\<company>\api\filing_history.json`
+- `output\full_reports_extraction_pipeline\run_<UTCSTAMP>\<company>\documents\<company>_latest_full_accounts_<document_id>.pdf`
+- `output\full_reports_extraction_pipeline\run_<UTCSTAMP>\<company>\extraction\extraction_result.json`
+- `output\full_reports_extraction_pipeline\run_<UTCSTAMP>\<company>\extraction\validation_warnings.json`
+- `output\full_reports_extraction_pipeline\run_<UTCSTAMP>\<company>\extraction\run_report.json`
+- Optional summary: `output\full_reports_extraction_pipeline\run_<UTCSTAMP>\summary.json`
+
+SQLite persistence (new pipeline DB):
+- Table `pipeline_runs`: run config + counters + CH request count.
+- Table `pipeline_jobs`: per-company download/extract status, attempts, errors, file paths, model used, and final rollup status.
 
 ## 13) Smoke Test And Final Validation
 
@@ -433,3 +576,5 @@ Known limitations:
 - Reconciliation uses tolerance `abs(diff) > 1`; small rounding differences are ignored.
 - Warnings only run when all required numeric inputs for the specific check are present.
 - LLM extraction quality depends on model output and document quality/layout.
+- Metadata normalization: if LLM returns a 7-digit `company_registration_number`, extraction left-pads it to 8 digits before strict validation.
+- For object sections (`metadata`, `governance`, `statement_of_financial_activities`, `detailed_balance_sheet`, `staffing_data`, `academy_trust_annual_report`), missing/null/wrong-type values are now coerced to `null` with a validation warning instead of hard-failing the whole extraction.
