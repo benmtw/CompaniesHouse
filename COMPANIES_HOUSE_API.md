@@ -328,7 +328,7 @@ Current extraction behavior:
 - `extract_latest_full_accounts(...)` selects the latest `FilingDocumentType.FULL_ACCOUNTS` document only for retrieval.
 - `extract_latest_mat_annual_report(...)` is a convenience wrapper that calls `extract_latest_full_accounts(...)` with `ExtractionType.AcademyTrustAnnualReport`.
 - Extraction itself is requested independently via `ExtractionType` (you can pass one or many):
-  - `ExtractionType.PersonnelDetails` -> `personnel_details[]`
+  - `ExtractionType.PersonnelDetails` -> `personnel_details[]` with `first_name`, `last_name`, `job_title`, `organisation_name`, `organisation_type` (`trust`/`school`)
   - `ExtractionType.BalanceSheet` -> legacy `balance_sheet[]` line-item output
   - `ExtractionType.Metadata` -> `metadata`
   - `ExtractionType.Governance` -> `governance`
@@ -442,6 +442,8 @@ Useful controls:
 - `--openrouter-timeout-seconds 60` to cap each OpenRouter extraction HTTP call at 1 minute (prevents long stalls on a single company)
 - `--write-openrouter-debug-artifacts` to persist full OpenRouter request/response artifacts per model attempt (includes full payload with file data URI, extracted schema body, and raw provider response)
 - `--schema-profile compact_single_call` (default) reduces schema nesting by removing duplicate deep annual-report branch from the request; `full_legacy` keeps prior full schema; `light_core` requests only lightweight sections; `personnel_only` requests only `PersonnelDetails`.
+- Personnel extraction guardrails: `personnel_only` excludes `Member`/`Trustee` roles and excludes rows marked as no longer current (for example `resigned`, `left`, `to <date>`, `until <date>`, `former`).
+- Personnel extraction now classifies each retained row with `organisation_type` (`trust`/`school`) and `organisation_name` (specific school where present, otherwise trust-level entity).
 - Adaptive fallback: when `compact_single_call` fails with a provider schema-depth error, batch extraction automatically retries with `light_core` for that company only
 
 Per-run output layout:

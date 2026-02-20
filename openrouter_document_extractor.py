@@ -165,9 +165,30 @@ class OpenRouterDocumentExtractor:
     @staticmethod
     def _build_prompts(requested_types: list[ExtractionType]) -> tuple[str, str]:
         task_lines: list[str] = []
+        personnel_guardrails = ""
         if ExtractionType.PersonnelDetails in requested_types:
             task_lines.append(
-                "- Extract personnel details with fields: first_name, last_name, job_title."
+                "- Extract personnel details with fields: first_name, last_name, job_title, "
+                "organisation_name, organisation_type."
+            )
+            personnel_guardrails = (
+                "For personnel_details, include only currently active non-trustee, non-member "
+                "roles.\n"
+                "Exclude any Member or Trustee rows (including Chair of Trustees).\n"
+                "Exclude people explicitly marked as not current, for example text containing "
+                "`resigned`, `left`, `to DD/MM/YYYY`, `until DD/MM/YYYY`, `ended`, "
+                "`end date`, `former`, or equivalent wording.\n"
+                "If two people hold the same exact role title and one is marked with an end "
+                "date while another is marked as starting later, include only the current "
+                "incumbent.\n"
+                "Set organisation_type to `school` when the person is tied to a specific school "
+                "(for example role text includes a school/academy name, or school leadership roles "
+                "such as Principal/Headteacher/Head of School).\n"
+                "Set organisation_type to `trust` for central/corporate trust roles (for example "
+                "CEO/COO/CFO/Director/Company secretary and other trust-wide corporate roles).\n"
+                "Set organisation_name to the specific school name for school roles. For trust "
+                "roles, set organisation_name to the trust entity (or `Trust (Central)` for "
+                "central-team roles).\n"
             )
         if ExtractionType.BalanceSheet in requested_types:
             task_lines.append("- Extract balance sheet values as line items.")
@@ -212,7 +233,8 @@ class OpenRouterDocumentExtractor:
             f"Requested extraction types: {[t.name for t in requested_types]}.\n"
             + "\n".join(task_lines)
             + "\n"
-            "Do not emit a personnel row unless first_name, last_name, and job_title "
+            + personnel_guardrails
+            + "Do not emit a personnel row unless first_name, last_name, and job_title "
             "are all present and non-empty.\n"
             "Do not emit a balance_sheet row unless line_item and value are both "
             "present and non-empty.\n"
@@ -293,8 +315,25 @@ class OpenRouterDocumentExtractor:
                             "type": "string",
                             "description": "Role or title at the company.",
                         },
+                        "organisation_name": {
+                            "type": "string",
+                            "description": (
+                                "Employing organisation name: school/academy name or trust entity."
+                            ),
+                        },
+                        "organisation_type": {
+                            "type": "string",
+                            "enum": ["trust", "school"],
+                            "description": "Whether the role is trust-level or school-level.",
+                        },
                     },
-                    "required": ["first_name", "last_name", "job_title"],
+                    "required": [
+                        "first_name",
+                        "last_name",
+                        "job_title",
+                        "organisation_name",
+                        "organisation_type",
+                    ],
                     "additionalProperties": False,
                 },
             }
@@ -950,13 +989,139 @@ class OpenRouterDocumentExtractor:
             raise DocumentExtractionError("Expected `personnel_details` to be a list")
         personnel: list[PersonnelDetail] = []
         for index, row in enumerate(raw_personnel):
+            if not isinstance(row, dict):
+                raise DocumentExtractionError(
+                    f"Invalid personnel_details row at index {index}: expected object"
+                )
+            job_title_raw = str(row.get("job_title", "")).strip()
+            inferred_org_name, inferred_org_type = OpenRouterDocumentExtractor._infer_personnel_organisation(
+                job_title_raw
+            )
+            prepared_row = dict(row)
+            prepared_row["organisation_name"] = str(
+                row.get("organisation_name") or inferred_org_name
+            ).strip()
+            prepared_row["organisation_type"] = str(
+                row.get("organisation_type") or inferred_org_type
+            ).strip()
             try:
-                personnel.append(PersonnelDetail.model_validate(row))
+                parsed = PersonnelDetail.model_validate(prepared_row)
             except ValidationError as exc:
                 raise DocumentExtractionError(
                     f"Invalid personnel_details row at index {index}: {exc}"
                 ) from exc
-        return personnel
+            if OpenRouterDocumentExtractor._should_exclude_personnel_row(parsed):
+                continue
+            personnel.append(parsed)
+        return OpenRouterDocumentExtractor._drop_superseded_duplicate_titles(personnel)
+
+    @staticmethod
+    def _should_exclude_personnel_row(row: PersonnelDetail) -> bool:
+        title = row.job_title.strip().lower()
+        blocked_titles = {
+            "member",
+            "members",
+            "trustee",
+            "trustees",
+            "chair of trustees",
+        }
+        if title in blocked_titles:
+            return True
+
+        # Exclude rows that indicate a role is no longer current.
+        status_patterns = (
+            r"\bresign(?:ed|ation)?\b",
+            r"\bleft\b",
+            r"\bformer\b",
+            r"\bended\b",
+            r"\bend date\b",
+            r"\buntil\b",
+            r"\bto\s+\d{1,2}[/-]\d{1,2}[/-]\d{2,4}\b",
+            r"\bto\s+\d{4}[/-]\d{1,2}[/-]\d{1,2}\b",
+        )
+        for pattern in status_patterns:
+            if re.search(pattern, title):
+                return True
+        return False
+
+    @staticmethod
+    def _drop_superseded_duplicate_titles(personnel: list[PersonnelDetail]) -> list[PersonnelDetail]:
+        seen_keys: set[tuple[str, str, str]] = set()
+        deduped_reversed: list[PersonnelDetail] = []
+        for row in reversed(personnel):
+            key = (
+                row.organisation_type.strip().lower(),
+                row.organisation_name.strip().lower(),
+                row.job_title.strip().lower(),
+            )
+            if key in seen_keys:
+                continue
+            seen_keys.add(key)
+            deduped_reversed.append(row)
+        return list(reversed(deduped_reversed))
+
+    @staticmethod
+    def _infer_personnel_organisation(job_title: str) -> tuple[str, str]:
+        title = str(job_title or "").strip()
+        if not title:
+            return ("Trust", "trust")
+
+        role_part = title
+        org_part = ""
+        if "," in title:
+            role_part, org_part = [part.strip() for part in title.split(",", 1)]
+
+        role_lower = role_part.lower()
+        org_lower = org_part.lower()
+
+        school_keywords = (
+            "academy",
+            "school",
+            "college",
+            "campus",
+            "provision",
+            "nursery",
+            "pupil referral",
+            "pru",
+        )
+        school_role_keywords = (
+            "principal",
+            "headteacher",
+            "head of school",
+            "assistant head",
+            "deputy head",
+        )
+        trust_role_keywords = (
+            "chief",
+            "officer",
+            "director",
+            "secretary",
+            "finance",
+            "operations",
+            "governance",
+            "central",
+            "trust",
+        )
+
+        if org_part and any(token in org_lower for token in school_keywords):
+            return (org_part, "school")
+
+        if any(token in role_lower for token in school_role_keywords):
+            school_name = org_part if org_part else "School (unspecified)"
+            return (school_name, "school")
+
+        if org_part and "central" in org_lower:
+            return ("Trust (Central)", "trust")
+
+        if any(token in role_lower for token in trust_role_keywords):
+            if org_part and "trust" in org_lower:
+                return (org_part, "trust")
+            return ("Trust (Central)" if "central" in org_lower else "Trust", "trust")
+
+        if org_part and "trust" in org_lower:
+            return (org_part, "trust")
+
+        return ("Trust", "trust")
 
     @staticmethod
     def _parse_balance_sheet(raw_balance: Any) -> list[BalanceSheetEntry]:

@@ -494,6 +494,8 @@ class CompaniesHouseClientTests(unittest.TestCase):
                     first_name="A",
                     last_name="B",
                     job_title="Director",
+                    organisation_name="Trust",
+                    organisation_type="trust",
                 )
             ],
         )
@@ -567,7 +569,13 @@ class OpenRouterDocumentExtractorTests(unittest.TestCase):
         llm_json = """
         {
           "personnel_details": [
-            {"first_name": "Ada", "last_name": "Lovelace", "job_title": "Director"}
+            {
+              "first_name": "Ada",
+              "last_name": "Lovelace",
+              "job_title": "Director",
+              "organisation_name": "Trust",
+              "organisation_type": "trust"
+            }
           ]
         }
         """
@@ -590,6 +598,8 @@ class OpenRouterDocumentExtractorTests(unittest.TestCase):
         self.assertEqual(result.personnel_details[0].first_name, "Ada")
         self.assertEqual(result.personnel_details[0].last_name, "Lovelace")
         self.assertEqual(result.personnel_details[0].job_title, "Director")
+        self.assertEqual(result.personnel_details[0].organisation_name, "Trust")
+        self.assertEqual(result.personnel_details[0].organisation_type, "trust")
         self.assertIsNone(result.balance_sheet)
         self.assertEqual(result.model, "openrouter/auto")
         self.assertEqual(result.requested_types, [ExtractionType.PersonnelDetails])
@@ -611,6 +621,55 @@ class OpenRouterDocumentExtractorTests(unittest.TestCase):
         self.assertIn("file", content[1])
         self.assertTrue(content[1]["file"]["file_data"].startswith("data:"))
         self.assertIn(";base64,", content[1]["file"]["file_data"])
+        prompt_text = content[0]["text"]
+        self.assertIn("Exclude any Member or Trustee rows", prompt_text)
+        self.assertIn("currently active non-trustee, non-member roles", prompt_text)
+        self.assertIn("organisation_name", prompt_text)
+        self.assertIn("organisation_type", prompt_text)
+
+    def test_extract_personnel_filters_non_current_members_and_trustees(self):
+        extractor = OpenRouterDocumentExtractor(api_key="or_key")
+        llm_json = """
+        {
+          "personnel_details": [
+            {"first_name": "A", "last_name": "One", "job_title": "Member"},
+            {"first_name": "B", "last_name": "Two", "job_title": "Trustee"},
+            {"first_name": "C", "last_name": "Three", "job_title": "Chair of Trustees"},
+            {"first_name": "D", "last_name": "Four", "job_title": "Principal (to 31/08/2025)"},
+            {"first_name": "E", "last_name": "Five", "job_title": "Chief Officer resigned 01/09/2025"},
+            {"first_name": "Old", "last_name": "Person", "job_title": "Principal, Torlands Academy"},
+            {"first_name": "New", "last_name": "Person", "job_title": "Principal, Torlands Academy"},
+            {"first_name": "F", "last_name": "Six", "job_title": "Principal"}
+          ]
+        }
+        """
+        response = {
+            "choices": [{"message": {"content": llm_json}}],
+        }
+        extractor._post_openrouter_chat_completion = Mock(return_value=response)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "full_accounts.txt")
+            with open(path, "w", encoding="utf-8") as fh:
+                fh.write("Sample full accounts text")
+
+            result = extractor.extract(
+                path,
+                extraction_types=[ExtractionType.PersonnelDetails],
+            )
+
+        rows = result.personnel_details or []
+        self.assertEqual(len(rows), 2)
+        self.assertEqual(rows[0].first_name, "New")
+        self.assertEqual(rows[0].last_name, "Person")
+        self.assertEqual(rows[0].job_title, "Principal, Torlands Academy")
+        self.assertEqual(rows[0].organisation_name, "Torlands Academy")
+        self.assertEqual(rows[0].organisation_type, "school")
+        self.assertEqual(rows[1].first_name, "F")
+        self.assertEqual(rows[1].last_name, "Six")
+        self.assertEqual(rows[1].job_title, "Principal")
+        self.assertEqual(rows[1].organisation_name, "School (unspecified)")
+        self.assertEqual(rows[1].organisation_type, "school")
 
     def test_extract_balance_sheet_only(self):
         extractor = OpenRouterDocumentExtractor(api_key="or_key")
