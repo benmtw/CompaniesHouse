@@ -203,8 +203,10 @@ class TestParslPipelineDatabase(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmpdir:
             state_path = Path(tmpdir) / "ch_throttle_state.json"
             lock_path = Path(tmpdir) / "ch_throttle_state.lock"
+            lock_path.write_text("stale lock", encoding="utf-8")
             _init_shared_throttle_state(state_path, lock_path, 0.2)
 
+            self.assertFalse(lock_path.exists())
             self.assertEqual(_read_shared_throttle_request_count(state_path), 0)
             payload = json.loads(state_path.read_text(encoding="utf-8"))
             self.assertTrue(payload["enabled"])
