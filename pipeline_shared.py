@@ -451,6 +451,8 @@ def install_request_throttle(
     *,
     lock: Any | None = None,
     shared_state: dict[str, Any] | None = None,
+    shared_state_path: str | None = None,
+    shared_lock_path: str | None = None,
 ) -> dict[str, Any]:
     state = shared_state if shared_state is not None else {}
     state["enabled"] = min_interval_seconds > 0
@@ -463,15 +465,66 @@ def install_request_throttle(
     throttle_lock = lock if lock is not None else threading.Lock()
     original_request = client.session.request
 
-    def throttled_request(*args: Any, **kwargs: Any) -> Any:
-        with throttle_lock:
+    def _update_file_backed_state() -> None:
+        if not shared_state_path or not shared_lock_path:
+            return
+
+        lock_path = Path(shared_lock_path)
+        state_path = Path(shared_state_path)
+        lock_path.parent.mkdir(parents=True, exist_ok=True)
+        state_path.parent.mkdir(parents=True, exist_ok=True)
+
+        lock_fd: int | None = None
+        while lock_fd is None:
+            try:
+                lock_fd = os.open(lock_path, os.O_CREAT | os.O_EXCL | os.O_RDWR)
+            except FileExistsError:
+                time.sleep(0.005)
+
+        try:
             now = time.monotonic()
-            elapsed = now - float(state["last_request_ts"])
+            file_state: dict[str, Any] = {
+                "last_request_ts": 0.0,
+                "request_count": 0,
+            }
+            if state_path.is_file():
+                try:
+                    file_state.update(
+                        json.loads(state_path.read_text(encoding="utf-8"))
+                    )
+                except json.JSONDecodeError:
+                    pass
+
+            elapsed = now - float(file_state.get("last_request_ts", 0.0))
             wait = min_interval_seconds - elapsed
             if wait > 0:
                 time.sleep(wait)
-            state["last_request_ts"] = time.monotonic()
-            state["request_count"] = int(state["request_count"]) + 1
+
+            file_state["last_request_ts"] = time.monotonic()
+            file_state["request_count"] = int(file_state.get("request_count", 0)) + 1
+            state["last_request_ts"] = float(file_state["last_request_ts"])
+            state["request_count"] = int(file_state["request_count"])
+            state_path.write_text(json.dumps(file_state), encoding="utf-8")
+        finally:
+            if lock_fd is not None:
+                os.close(lock_fd)
+            try:
+                lock_path.unlink()
+            except FileNotFoundError:
+                pass
+
+    def throttled_request(*args: Any, **kwargs: Any) -> Any:
+        with throttle_lock:
+            if shared_state_path and shared_lock_path:
+                _update_file_backed_state()
+            else:
+                now = time.monotonic()
+                elapsed = now - float(state["last_request_ts"])
+                wait = min_interval_seconds - elapsed
+                if wait > 0:
+                    time.sleep(wait)
+                state["last_request_ts"] = time.monotonic()
+                state["request_count"] = int(state["request_count"]) + 1
         return original_request(*args, **kwargs)
 
     client.session.request = throttled_request

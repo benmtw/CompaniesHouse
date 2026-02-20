@@ -474,7 +474,7 @@ Purpose:
 - Separate worker pools are used:
   - `--ch-workers` for CH download stage
   - `--or-workers` for OpenRouter extraction stage
-- Shared global CH throttle applies across all CH requests from all threads using `--ch-min-request-interval-seconds`.
+- Shared global CH throttle applies across all CH requests from all threads/processes using `--ch-min-request-interval-seconds` (including Parsl HTEX workers).
 - Bounded queue between stages (`--max-pending-extractions`) provides backpressure when extraction is slower.
 - Dedicated SQLite state DB/tables are used (`pipeline_runs`, `pipeline_jobs`), separate from legacy batch DB tables.
 

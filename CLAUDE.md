@@ -95,7 +95,7 @@ The primary pipeline is `companies_house_parsl_pipeline.py` which uses Parsl for
 
 ### Global Throttling
 
-Parsl apps use module-level throttle state (`_CH_THROTTLE_STATE`) shared across workers in the same process. This ensures Companies House rate limits are respected even with parallel execution.
+Parsl apps use a run-scoped file-backed throttle state (`ch_throttle_state.json` + file lock) shared across all worker processes/threads. This keeps Companies House pacing global even when running with `--executor-type htex`.
 
 ## Conventions
 

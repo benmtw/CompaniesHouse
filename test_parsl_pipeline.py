@@ -192,6 +192,62 @@ class TestParslPipelineCLI(unittest.TestCase):
 class TestParslPipelineDatabase(unittest.TestCase):
     """Tests for SQLite database operations."""
 
+
+    def test_init_shared_throttle_state_and_count_read(self):
+        """Shared throttle state file should initialize and report request count."""
+        from companies_house_parsl_pipeline import (
+            _init_shared_throttle_state,
+            _read_shared_throttle_request_count,
+        )
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            state_path = Path(tmpdir) / "ch_throttle_state.json"
+            lock_path = Path(tmpdir) / "ch_throttle_state.lock"
+            _init_shared_throttle_state(state_path, lock_path, 0.2)
+
+            self.assertEqual(_read_shared_throttle_request_count(state_path), 0)
+            payload = json.loads(state_path.read_text(encoding="utf-8"))
+            self.assertTrue(payload["enabled"])
+            self.assertEqual(payload["min_interval_seconds"], 0.2)
+
+    def test_file_backed_throttle_enforces_spacing_and_updates_count(self):
+        """File-backed throttle should coordinate request count and delay."""
+        import time
+
+        from companies_house_client import CompaniesHouseClient
+        from pipeline_shared import install_request_throttle
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            state_path = Path(tmpdir) / "ch_throttle_state.json"
+            lock_path = Path(tmpdir) / "ch_throttle_state.lock"
+            state_path.write_text(
+                json.dumps({
+                    "enabled": True,
+                    "min_interval_seconds": 0.05,
+                    "last_request_ts": 0.0,
+                    "request_count": 0,
+                }),
+                encoding="utf-8",
+            )
+
+            client = CompaniesHouseClient(api_key="k")
+            client.session.request = MagicMock(return_value={"ok": True})
+            install_request_throttle(
+                client=client,
+                min_interval_seconds=0.05,
+                shared_state_path=str(state_path),
+                shared_lock_path=str(lock_path),
+            )
+
+            started = time.monotonic()
+            client.session.request("GET", "https://example.test/1")
+            client.session.request("GET", "https://example.test/2")
+            elapsed = time.monotonic() - started
+
+            self.assertGreaterEqual(elapsed, 0.04)
+            payload = json.loads(state_path.read_text(encoding="utf-8"))
+            self.assertEqual(payload.get("request_count"), 2)
+
     def test_create_tables(self):
         """Test table creation."""
         from companies_house_parsl_pipeline import _create_tables

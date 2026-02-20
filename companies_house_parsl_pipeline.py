@@ -22,9 +22,8 @@ import platform
 import random
 import sqlite3
 import sys
-import threading
 import time
-from dataclasses import dataclass, field
+import threading
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -42,7 +41,7 @@ if platform.system() == "Windows":
     sys.exit(1)
 
 import parsl
-from parsl_pipeline_apps import _CH_THROTTLE_STATE, process_company
+from parsl_pipeline_apps import process_company
 from parsl_pipeline_config import create_pipeline_config
 from pipeline_shared import (
     add_common_extraction_cli_args,
@@ -64,27 +63,27 @@ DEFAULT_OR_WORKERS = 4
 DEFAULT_CH_CACHE_DIR = "output/ch_document_cache"
 
 
-@dataclass
-class GlobalCHThrottle:
-    """Wrapper for global throttle state passed to Parsl apps."""
+def _read_shared_throttle_request_count(state_path: Path) -> int:
+    if not state_path.is_file():
+        return 0
+    try:
+        payload = json.loads(state_path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError:
+        return 0
+    return int(payload.get("request_count", 0))
 
-    min_interval_seconds: float
-    lock: threading.Lock
-    state: dict[str, Any] = field(default_factory=dict)
 
-    def __post_init__(self) -> None:
-        self.state.setdefault("enabled", self.min_interval_seconds > 0)
-        self.state.setdefault("min_interval_seconds", self.min_interval_seconds)
-        self.state.setdefault("last_request_ts", 0.0)
-        self.state.setdefault("request_count", 0)
-
-    @property
-    def enabled(self) -> bool:
-        return self.min_interval_seconds > 0
-
-    @property
-    def request_count(self) -> int:
-        return int(self.state.get("request_count", 0))
+def _init_shared_throttle_state(state_path: Path, lock_path: Path, min_interval_seconds: float) -> None:
+    state_path.parent.mkdir(parents=True, exist_ok=True)
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    lock_path.touch(exist_ok=True)
+    state_payload = {
+        "enabled": min_interval_seconds > 0,
+        "min_interval_seconds": min_interval_seconds,
+        "last_request_ts": 0.0,
+        "request_count": 0,
+    }
+    state_path.write_text(json.dumps(state_payload), encoding="utf-8")
 
 
 def _utc_now() -> str:
@@ -715,13 +714,14 @@ def main() -> int:
             },
         )
 
-    # Initialize global throttle state
-    shared_throttle = GlobalCHThrottle(
+    # Initialize cross-process throttle state for HTEX worker processes.
+    throttle_state_path = run_dir / "ch_throttle_state.json"
+    throttle_lock_path = run_dir / "ch_throttle_state.lock"
+    _init_shared_throttle_state(
+        state_path=throttle_state_path,
+        lock_path=throttle_lock_path,
         min_interval_seconds=args.ch_min_request_interval_seconds,
-        lock=threading.Lock(),
     )
-    # Sync with module-level state used by Parsl apps
-    _CH_THROTTLE_STATE.update(shared_throttle.state)
 
     # Build model candidates
     model_candidates = [args.model] + parse_fallback_models(args.fallback_models)
@@ -740,7 +740,11 @@ def main() -> int:
         "ch_api_key": ch_api_key,
         "filing_history_items_per_page": args.filing_history_items_per_page,
         "cache_dir": DEFAULT_CH_CACHE_DIR,
-        "throttle_config": {"min_interval_seconds": args.ch_min_request_interval_seconds},
+        "throttle_config": {
+            "min_interval_seconds": args.ch_min_request_interval_seconds,
+            "shared_state_path": str(throttle_state_path),
+            "shared_lock_path": str(throttle_lock_path),
+        },
     }
 
     extract_config = {
@@ -754,7 +758,11 @@ def main() -> int:
         "cache_dir": DEFAULT_CH_CACHE_DIR,
         "ch_api_key": ch_api_key if args.mode == "extract" else None,
         "filing_history_items_per_page": args.filing_history_items_per_page,
-        "throttle_config": {"min_interval_seconds": args.ch_min_request_interval_seconds},
+        "throttle_config": {
+            "min_interval_seconds": args.ch_min_request_interval_seconds,
+            "shared_state_path": str(throttle_state_path),
+            "shared_lock_path": str(throttle_lock_path),
+        },
     }
 
     # Create and load Parsl config
@@ -816,8 +824,8 @@ def main() -> int:
     finally:
         parsl.clear()
 
-    # Get final CH request count from module-level state
-    ch_request_count = int(_CH_THROTTLE_STATE.get("request_count", 0))
+    # Get final CH request count from cross-process state file.
+    ch_request_count = _read_shared_throttle_request_count(throttle_state_path)
 
     # Finalize run
     time.sleep(0.05)

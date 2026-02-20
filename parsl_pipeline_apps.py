@@ -10,7 +10,6 @@ from __future__ import annotations
 
 import platform
 import sys
-import threading
 import traceback
 from typing import Any
 
@@ -23,10 +22,6 @@ if platform.system() == "Windows":
     )
 
 from parsl import join_app, python_app
-
-# Module-level throttle state (shared across workers in same process)
-_CH_THROTTLE_LOCK = threading.Lock()
-_CH_THROTTLE_STATE: dict[str, Any] = {"last_request_ts": 0.0, "request_count": 0}
 
 MAX_ERROR_TRACEBACK_CHARS = 4000
 
@@ -74,15 +69,12 @@ def download_company_document(
         write_json,
     )
 
-    # Use module-level throttle state for workers in same process
-    global _CH_THROTTLE_STATE, _CH_THROTTLE_LOCK
-
     client = CompaniesHouseClient(api_key=ch_api_key, cache_dir=cache_dir)
     install_request_throttle(
         client=client,
         min_interval_seconds=throttle_config.get("min_interval_seconds", 2.0),
-        lock=_CH_THROTTLE_LOCK,
-        shared_state=_CH_THROTTLE_STATE,
+        shared_state_path=str(throttle_config.get("shared_state_path") or "").strip() or None,
+        shared_lock_path=str(throttle_config.get("shared_lock_path") or "").strip() or None,
     )
 
     run_dir_path = Path(run_dir)
@@ -256,15 +248,13 @@ def extract_document(
 
     if resolved_pdf_path is None and ch_api_key:
         # Fall back to downloading
-        global _CH_THROTTLE_STATE, _CH_THROTTLE_LOCK
-
         client = CompaniesHouseClient(api_key=ch_api_key, cache_dir=cache_dir)
         if throttle_config:
             install_request_throttle(
                 client=client,
                 min_interval_seconds=throttle_config.get("min_interval_seconds", 2.0),
-                lock=_CH_THROTTLE_LOCK,
-                shared_state=_CH_THROTTLE_STATE,
+                shared_state_path=str(throttle_config.get("shared_state_path") or "").strip() or None,
+                shared_lock_path=str(throttle_config.get("shared_lock_path") or "").strip() or None,
             )
 
         company_dir = run_dir_path / company_number
