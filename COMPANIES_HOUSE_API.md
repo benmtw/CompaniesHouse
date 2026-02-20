@@ -12,6 +12,22 @@ Source files used:
 - `Document API_ Fetch a document's metadata.html`
 - `Document API_ Fetch a document.html`
 
+## IMPORTANT: Extraction Profile Accuracy Note (February 20, 2026)
+
+For personnel extraction quality, use `schema-profile personnel_only` when personnel completeness matters.
+
+Measured result from first 100 trusts in `SourceData/allgroupslinksdata20260217/Trusts.xlsx`:
+- Baseline run (`personnel_only`): `output/trusts_extraction/run_20260220T121541Z`
+- Comparison run (`light_core`): `output/trusts_extraction/run_20260220T122713Z`
+- Both runs succeeded for 84 trusts (comparable set).
+- Exact personnel match: 7/84 trusts.
+- Raw personnel rows returned: `personnel_only=2258`, `light_core=1224` (54.2% retained by `light_core`).
+- Outlier-trimmed (drop top 5% largest absolute trust-level deltas: 4 trusts): `personnel_only=1814`, `light_core=1178` (64.9% retained by `light_core`).
+- Median personnel rows per trust (both-success set): `personnel_only=21`, `light_core=9`.
+
+Conclusion: requesting broader output with `light_core` substantially reduced personnel completeness in this test, even after excluding outliers.
+Model scope note: this observation is from runs using `google/gemini-2.5-flash-lite` only; behavior may differ with other models, so do not generalize without model-specific validation.
+
 ## 0) Live Reference Notes (from developer-specs site)
 
 Visited links:

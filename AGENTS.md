@@ -53,3 +53,4 @@ Expected usage:
 - Use Windows PowerShell-compatible commands in docs/examples.
 - When looking up information on third-party libraries, query the `context7` MCP server first before attempting web search.
 - For live API/integration runs in Codex, request escalated execution (outside sandbox) and run commands directly with `.\.venv\Scripts\python`.
+- Process monitoring: avoid self-matching patterns like `pgrep -f <pattern>` loops. Capture PID from process start, monitor with `Get-Process -Id <PID>` (PowerShell) or `ps -p <PID>` (bash), and only use `Stop-Process -Id <PID>`/`kill <PID>` when termination is required.
