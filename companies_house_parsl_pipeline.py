@@ -76,7 +76,13 @@ def _read_shared_throttle_request_count(state_path: Path) -> int:
 def _init_shared_throttle_state(state_path: Path, lock_path: Path, min_interval_seconds: float) -> None:
     state_path.parent.mkdir(parents=True, exist_ok=True)
     lock_path.parent.mkdir(parents=True, exist_ok=True)
-    lock_path.touch(exist_ok=True)
+    # The lock file must not pre-exist: file-backed throttle acquires the lock by
+    # atomically creating this path with O_CREAT|O_EXCL and removes it on release.
+    # If this file is left behind from a prior run, workers could spin forever.
+    try:
+        lock_path.unlink()
+    except FileNotFoundError:
+        pass
     state_payload = {
         "enabled": min_interval_seconds > 0,
         "min_interval_seconds": min_interval_seconds,
