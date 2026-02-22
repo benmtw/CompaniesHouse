@@ -13,12 +13,13 @@ from typing import Any
 from zipfile import ZipFile
 
 from companies_house_client import CompaniesHouseClient
+from company_type import CompanyType
 from document_extraction_models import ExtractionType
 from openrouter_document_extractor import DocumentExtractionError, OpenRouterDocumentExtractor
 
 
 DEFAULT_INPUT_XLSX = "SourceData/allgroupslinksdata20260217/Trusts.xlsx"
-DEFAULT_OUTPUT_ROOT = "output/trusts_extraction"
+DEFAULT_OUTPUT_ROOT = "output/companies_extraction"
 DEFAULT_DB_NAME = "companies_house_extractions.db"
 MAX_ERROR_TRACEBACK_CHARS = 4000
 
@@ -279,7 +280,15 @@ def _latest_full_accounts_document_id_from_filing_history(
     return CompaniesHouseClient._extract_document_id(metadata_url)
 
 
-def _extraction_types_for_schema_profile(schema_profile: str) -> list[ExtractionType]:
+def _extraction_types_for_schema_profile(
+    schema_profile: str,
+    company_type: CompanyType = CompanyType.GENERIC,
+) -> list[ExtractionType]:
+    annual_report_type = (
+        ExtractionType.AcademyTrustAnnualReport
+        if company_type == CompanyType.ACADEMY_TRUST
+        else ExtractionType.AnnualReport
+    )
     if schema_profile == "full_legacy":
         return [
             ExtractionType.PersonnelDetails,
@@ -289,7 +298,7 @@ def _extraction_types_for_schema_profile(schema_profile: str) -> list[Extraction
             ExtractionType.StatementOfFinancialActivities,
             ExtractionType.DetailedBalanceSheet,
             ExtractionType.StaffingData,
-            ExtractionType.AcademyTrustAnnualReport,
+            annual_report_type,
         ]
     if schema_profile == "compact_single_call":
         return [
@@ -342,12 +351,15 @@ def _extract_with_model_fallback(
     document_path: str,
     extraction_types: list[ExtractionType],
     retries_on_invalid_json: int = 2,
+    company_type: CompanyType = CompanyType.GENERIC,
 ) -> tuple[dict[str, Any], list[str], str]:
     errors: list[str] = []
     for model in model_candidates:
         attempts = retries_on_invalid_json + 1
         for attempt in range(1, attempts + 1):
-            extractor = OpenRouterDocumentExtractor(api_key=api_key, model=model)
+            extractor = OpenRouterDocumentExtractor(
+                api_key=api_key, model=model, company_type=company_type
+            )
             try:
                 result = extractor.extract(
                     document_path=document_path,
@@ -548,12 +560,21 @@ def _insert_company_row(
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Batch extract Companies House full account reports from Trusts.xlsx."
+        description="Batch extract Companies House full account reports."
     )
     parser.add_argument(
         "--input-xlsx",
         default=DEFAULT_INPUT_XLSX,
-        help="Path to Trusts.xlsx file",
+        help="Path to input XLSX file containing company numbers",
+    )
+    parser.add_argument(
+        "--company-type",
+        choices=[ct.value for ct in CompanyType],
+        default=CompanyType.GENERIC.value,
+        help=(
+            "Type of company being processed. Controls LLM prompt text and "
+            "extraction model fields (default: generic)"
+        ),
     )
     parser.add_argument(
         "--output-root",
@@ -670,6 +691,8 @@ def main() -> int:
     if args.retries_on_invalid_json < 0:
         raise ValueError("retries_on_invalid_json must be >= 0")
 
+    company_type = CompanyType(args.company_type)
+
     output_root = Path(args.output_root)
     run_stamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
     output_run_dir = output_root / f"run_{run_stamp}"
@@ -680,7 +703,7 @@ def main() -> int:
     conn = sqlite3.connect(db_path)
     _create_tables(conn)
 
-    extraction_types = _extraction_types_for_schema_profile(args.schema_profile)
+    extraction_types = _extraction_types_for_schema_profile(args.schema_profile, company_type)
 
     run_id = _insert_run(
         conn=conn,
@@ -747,6 +770,7 @@ def main() -> int:
         )
     )
     print("[run {}] schema_profile={}".format(run_id, args.schema_profile))
+    print("[run {}] company_type={}".format(run_id, company_type.value))
 
     client = CompaniesHouseClient(api_key=ch_api_key)
     throttle_state = _install_companies_house_request_throttle(
@@ -828,6 +852,7 @@ def main() -> int:
                     document_path=downloaded_path,
                     extraction_types=run_extraction_types,
                     retries_on_invalid_json=args.retries_on_invalid_json,
+                    company_type=company_type,
                 )
             except DocumentExtractionError as exc:
                 if (
@@ -837,7 +862,7 @@ def main() -> int:
                     had_schema_depth_error = True
                     extraction_schema_profile = "light_core"
                     run_extraction_types = _extraction_types_for_schema_profile(
-                        extraction_schema_profile
+                        extraction_schema_profile, company_type
                     )
                     extraction_payload, warnings_payload, model_used = _extract_with_model_fallback(
                         api_key=openrouter_api_key,
@@ -845,14 +870,20 @@ def main() -> int:
                         document_path=downloaded_path,
                         extraction_types=run_extraction_types,
                         retries_on_invalid_json=args.retries_on_invalid_json,
+                        company_type=company_type,
                     )
                 else:
                     raise
 
-            if extraction_payload.get("academy_trust_annual_report") is None:
+            annual_report_key = (
+                "academy_trust_annual_report"
+                if company_type == CompanyType.ACADEMY_TRUST
+                else "annual_report"
+            )
+            if extraction_payload.get(annual_report_key) is None:
                 derived = _derive_annual_report_from_component_sections(extraction_payload)
                 if derived is not None:
-                    extraction_payload["academy_trust_annual_report"] = derived
+                    extraction_payload[annual_report_key] = derived
             stage = "extraction_ok"
 
             profile_path = api_dir / "profile.json"
@@ -990,7 +1021,8 @@ def main() -> int:
             else output_run_dir / "summary.json"
         )
         summary_payload = {
-            "run_type": "batch_extract_trusts",
+            "run_type": "batch_extract_companies",
+            "company_type": company_type.value,
             "run_id": run_id,
             "timestamp_utc": _utc_now(),
             "input_xlsx_path": str(input_xlsx),
