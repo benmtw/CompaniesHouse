@@ -2,7 +2,7 @@
 
 ## 1. Executive Summary
 
-This document examines how to convert the CompaniesHouse project into Prefect 3.x workflows. The project currently runs as a monolithic batch script (`batch_extract_trusts.py`) that sequentially processes companies from an XLSX input, calling the Companies House API and OpenRouter LLM extraction for each. Converting to Prefect would add observability, retry management, concurrency control, scheduling, and per-company visibility into the pipeline.
+This document examines how to convert the CompaniesHouse project into Prefect 3.x workflows. The project currently runs as a monolithic batch script (`batch_extract_companies.py`) that sequentially processes companies from an XLSX input, calling the Companies House API and OpenRouter LLM extraction for each. Converting to Prefect would add observability, retry management, concurrency control, scheduling, and per-company visibility into the pipeline.
 
 ---
 
@@ -12,10 +12,11 @@ This document examines how to convert the CompaniesHouse project into Prefect 3.
 
 | File | Role |
 |---|---|
-| `batch_extract_trusts.py` | Main batch orchestrator: reads XLSX, iterates companies, coordinates API calls + extraction, writes results to SQLite + JSON |
+| `batch_extract_companies.py` | Main batch orchestrator: reads XLSX, iterates companies, coordinates API calls + extraction, writes results to SQLite + JSON. Accepts `--company-type` flag (generic or academy_trust) |
+| `company_type.py` | `CompanyType` enum (GENERIC, ACADEMY_TRUST) and prompt profiles controlling LLM text, field names, and terminology per company type |
 | `companies_house_client.py` | HTTP client for Companies House Public Data & Document APIs (search, profile, filing history, document download) |
-| `openrouter_document_extractor.py` | Sends downloaded PDFs to OpenRouter LLM API for structured data extraction |
-| `document_extraction_models.py` | Pydantic models for all extraction schemas (personnel, balance sheet, governance, SOFA, staffing, annual report) |
+| `openrouter_document_extractor.py` | Sends downloaded PDFs to OpenRouter LLM API for structured data extraction. Accepts `company_type` to select prompts and schemas |
+| `document_extraction_models.py` | Pydantic models for all extraction schemas. Includes both trust-specific (`AcademyTrustAnnualReport`, `Metadata`, `TrusteeAttendance`) and generic (`AnnualReport`, `CompanyMetadata`, `DirectorAttendance`) models |
 | `test_companies_house_client.py` | Unit tests (mocked HTTP) |
 
 ### 2.2 Current Data Flow
@@ -55,7 +56,9 @@ FOR EACH company (sequential):
 ### 3.1 Flow Hierarchy
 
 ```
-batch_extract_trusts_flow (top-level flow)
+batch_extract_companies_flow (top-level flow)
+    |
+    |-- Parameters include company_type: CompanyType (GENERIC or ACADEMY_TRUST)
     |
     |-- load_and_prepare_batch (task)
     |       Read XLSX, deduplicate, apply slicing/sampling
@@ -69,7 +72,7 @@ batch_extract_trusts_flow (top-level flow)
     |           |-- fetch_filing_history (task)
     |           |-- find_latest_full_accounts (task)
     |           |-- download_document (task)
-    |           |-- extract_document (task)
+    |           |-- extract_document (task)  ← receives company_type
     |           |-- save_results (task)
     |
     |-- finalize_run (task)
@@ -102,7 +105,7 @@ def load_and_prepare_batch(
 ) -> list[dict]:
     """Read XLSX, deduplicate company numbers, apply slicing/sampling."""
     # Wraps: read_xlsx_rows() + normalize_company_number() + slicing logic
-    # from batch_extract_trusts.py lines 695-719
+    # from batch_extract_companies.py
 ```
 
 #### `initialize_run`
@@ -200,9 +203,12 @@ def extract_document(
     extraction_types: list[ExtractionType],
     retries_on_invalid_json: int = 2,
     schema_profile: str = "compact_single_call",
+    company_type: CompanyType = CompanyType.GENERIC,
 ) -> tuple[dict, list[str], str]:
-    """Run LLM extraction with model fallback + schema fallback."""
+    """Run LLM extraction with model fallback + schema fallback.
+    company_type controls which prompt text and schema field names are used."""
     # Wraps: _extract_with_model_fallback() + schema depth fallback logic
+    # CompanyType is a str enum -- Prefect serializes it natively as a parameter
 ```
 
 #### `save_results`
@@ -239,6 +245,7 @@ def process_company_flow(
     openrouter_api_key: str,
     model_candidates: list[str],
     extraction_types: list[ExtractionType],
+    company_type: CompanyType,
     item: dict,
     run_id: int,
     output_run_dir: str,
@@ -264,6 +271,7 @@ def process_company_flow(
         extraction_types=extraction_types,
         retries_on_invalid_json=retries_on_invalid_json,
         schema_profile=schema_profile,
+        company_type=company_type,
     )
 
     result = save_results(
@@ -286,20 +294,25 @@ def process_company_flow(
 ### 4.3 Top-Level Flow
 
 ```python
+from company_type import CompanyType
+
 @flow(
-    name="batch-extract-trusts",
+    name="batch-extract-companies",
     log_prints=True,
     task_runner=ThreadPoolTaskRunner(max_workers=1),  # See concurrency section
 )
-def batch_extract_trusts_flow(
+def batch_extract_companies_flow(
     input_xlsx: str = DEFAULT_INPUT_XLSX,
     output_root: str = DEFAULT_OUTPUT_ROOT,
     model: str = "",
     max_companies: int = 0,
     start_index: int = 0,
     schema_profile: str = "compact_single_call",
+    company_type: str = "generic",  # Prefect UI passes strings; convert below
     # ... other params matching current CLI args
 ):
+    ct = CompanyType(company_type)
+    extraction_types = _extraction_types_for_schema_profile(schema_profile, ct)
     batch = load_and_prepare_batch(input_xlsx, start_index, max_companies, ...)
     run_context = initialize_run(input_xlsx, output_root, model, extraction_types)
 
@@ -307,6 +320,7 @@ def batch_extract_trusts_flow(
     for item in batch:
         result = process_company_flow(
             client=run_context["client"],
+            company_type=ct,
             item=item,
             run_id=run_context["run_id"],
             ...
@@ -315,6 +329,8 @@ def batch_extract_trusts_flow(
 
     finalize_run(run_context, results)
 ```
+
+> **Note on CompanyType with Prefect**: `CompanyType` is a `str` enum (`class CompanyType(str, Enum)`), so Prefect 3.x serializes it natively as a string parameter. When deploying via the Prefect UI or API, pass `"generic"` or `"academy_trust"` as the `company_type` parameter value. The flow converts it to the enum internally.
 
 ---
 
@@ -434,10 +450,11 @@ def fetch_company_profile(client, company_number):
 ```python
 if __name__ == "__main__":
     args = build_parser().parse_args()
-    batch_extract_trusts_flow(
+    batch_extract_companies_flow(
         input_xlsx=args.input_xlsx,
         output_root=args.output_root,
         model=args.model,
+        company_type=args.company_type,
         ...
     )
 ```
@@ -450,9 +467,10 @@ For deployed flows, parameters are set through the Prefect UI or API.
 
 ```
 CompaniesHouse/
+    company_type.py                    # CompanyType enum + prompt profiles
     companies_house_client.py          # Unchanged (API client)
-    document_extraction_models.py      # Unchanged (Pydantic models)
-    openrouter_document_extractor.py   # Unchanged (LLM extractor)
+    document_extraction_models.py      # Pydantic models (trust-specific + generic)
+    openrouter_document_extractor.py   # LLM extractor (company-type-aware)
     flows/
         __init__.py
         batch_extract.py               # Top-level flow + subflows
@@ -462,10 +480,10 @@ CompaniesHouse/
             companies_house.py         # fetch_company_profile, fetch_filing_history, download_document
             extraction.py              # find_latest_full_accounts, extract_document
             persistence.py             # save_results
-    prefect.yaml                       # Deployment configuration
+    prefect.yaml                       # Deployment configuration (multiple deployments per company_type)
     requirements.txt                   # Add: prefect>=3.0
-    batch_extract_trusts.py            # Keep as legacy CLI entry point, calls flow
-    test_companies_house_client.py     # Unchanged
+    batch_extract_companies.py         # CLI entry point, calls flow
+    test_companies_house_client.py     # Unit tests
 ```
 
 ---
@@ -478,9 +496,10 @@ Simplest option. The flow process runs continuously and picks up scheduled or ma
 
 ```python
 if __name__ == "__main__":
-    batch_extract_trusts_flow.serve(
-        name="batch-extract-trusts-local",
+    batch_extract_companies_flow.serve(
+        name="batch-extract-companies-local",
         cron="0 6 * * 1",  # Weekly Monday 6am
+        parameters={"company_type": "generic"},  # or "academy_trust"
     )
 ```
 
@@ -489,13 +508,27 @@ if __name__ == "__main__":
 For production with Prefect Cloud or self-hosted server:
 
 ```python
-batch_extract_trusts_flow.deploy(
+# Deploy for academy trusts
+batch_extract_companies_flow.deploy(
     name="batch-extract-trusts-prod",
     work_pool_name="default-agent-pool",
     cron="0 6 * * 1",
     parameters={
         "input_xlsx": "SourceData/allgroupslinksdata20260217/Trusts.xlsx",
         "schema_profile": "compact_single_call",
+        "company_type": "academy_trust",
+    },
+)
+
+# Deploy for generic companies (different input, schedule, etc.)
+batch_extract_companies_flow.deploy(
+    name="batch-extract-companies-prod",
+    work_pool_name="default-agent-pool",
+    cron="0 8 * * 1",
+    parameters={
+        "input_xlsx": "SourceData/companies.xlsx",
+        "schema_profile": "compact_single_call",
+        "company_type": "generic",
     },
 )
 ```
@@ -505,15 +538,28 @@ batch_extract_trusts_flow.deploy(
 ```yaml
 deployments:
   - name: batch-extract-trusts
-    entrypoint: flows/batch_extract.py:batch_extract_trusts_flow
+    entrypoint: flows/batch_extract.py:batch_extract_companies_flow
     work_pool:
       name: default
     parameters:
       input_xlsx: "SourceData/allgroupslinksdata20260217/Trusts.xlsx"
-      output_root: "output/trusts_extraction"
+      output_root: "output/companies_extraction"
       schema_profile: "compact_single_call"
+      company_type: "academy_trust"
     schedules:
       - cron: "0 6 * * 1"
+
+  - name: batch-extract-companies
+    entrypoint: flows/batch_extract.py:batch_extract_companies_flow
+    work_pool:
+      name: default
+    parameters:
+      input_xlsx: "SourceData/companies.xlsx"
+      output_root: "output/companies_extraction"
+      schema_profile: "compact_single_call"
+      company_type: "generic"
+    schedules:
+      - cron: "0 8 * * 1"
 ```
 
 ---
@@ -524,11 +570,12 @@ deployments:
 
 1. Add `prefect>=3.0` to `requirements.txt`
 2. Create `flows/` directory structure
-3. Extract functions from `batch_extract_trusts.py` into task/flow files with `@task` and `@flow` decorators
-4. Keep processing sequential (`max_workers=1`)
-5. Keep existing SQLite persistence
-6. Keep existing rate limiting mechanism
-7. Test: run the flow locally, verify identical output to current script
+3. Extract functions from `batch_extract_companies.py` into task/flow files with `@task` and `@flow` decorators
+4. Thread `company_type` parameter through the flow hierarchy (top-level flow -> subflow -> extract_document task)
+5. Keep processing sequential (`max_workers=1`)
+6. Keep existing SQLite persistence
+7. Keep existing rate limiting mechanism
+8. Test: run the flow locally with both `--company-type generic` and `--company-type academy_trust`, verify identical output to current script
 
 **Benefit**: Full Prefect observability (UI dashboard, logs, run history) with minimal risk.
 
@@ -558,7 +605,8 @@ deployments:
 Some components should remain as-is:
 
 - **`CompaniesHouseClient`**: This is a clean, stateless-ish HTTP client. It should not have Prefect decorators. Tasks *call* it; it doesn't become a task itself.
-- **`OpenRouterDocumentExtractor`**: Same reasoning. Keep it as a plain class.
+- **`OpenRouterDocumentExtractor`**: Same reasoning. Keep it as a plain class. It already accepts `company_type` via its constructor.
+- **`company_type.py`**: Pure enum and config dicts. No orchestration concern.
 - **`document_extraction_models.py`**: Pure Pydantic models. No orchestration concern.
 - **`test_companies_house_client.py`**: Unit tests should test the client in isolation, not through Prefect.
 
