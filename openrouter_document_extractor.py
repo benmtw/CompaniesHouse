@@ -47,7 +47,7 @@ class OpenRouterDocumentExtractor:
         api_key: str | None = None,
         model: str = "openrouter/auto",
         max_document_chars: int = 35000,
-        company_type: CompanyType = CompanyType.GENERIC,
+        company_type: CompanyType = CompanyType.ACADEMY_TRUST,
     ) -> None:
         resolved_key = api_key or os.getenv("OPENROUTER_API_KEY")
         if not resolved_key:
@@ -297,11 +297,17 @@ class OpenRouterDocumentExtractor:
             required.append("balance_sheet")
 
         if ExtractionType.Metadata in requested_types:
-            properties["metadata"] = OpenRouterDocumentExtractor._schema_for_metadata()
+            if company_type == CompanyType.GENERIC:
+                properties["metadata"] = OpenRouterDocumentExtractor._schema_for_company_metadata()
+            else:
+                properties["metadata"] = OpenRouterDocumentExtractor._schema_for_metadata()
             required.append("metadata")
 
         if ExtractionType.Governance in requested_types:
-            properties["governance"] = OpenRouterDocumentExtractor._schema_for_governance()
+            if company_type == CompanyType.GENERIC:
+                properties["governance"] = OpenRouterDocumentExtractor._schema_for_company_governance()
+            else:
+                properties["governance"] = OpenRouterDocumentExtractor._schema_for_governance()
             required.append("governance")
 
         if ExtractionType.StatementOfFinancialActivities in requested_types:
@@ -729,8 +735,8 @@ class OpenRouterDocumentExtractor:
     ) -> ExtractionResult:
         personnel_details: list[PersonnelDetail] | None = None
         balance_sheet: list[BalanceSheetEntry] | None = None
-        metadata: Metadata | None = None
-        governance: Governance | None = None
+        metadata: Metadata | CompanyMetadata | None = None
+        governance: Governance | CompanyGovernance | None = None
         statement_of_financial_activities: StatementOfFinancialActivities | None = None
         detailed_balance_sheet: DetailedBalanceSheet | None = None
         staffing_data: StaffingData | None = None
@@ -748,11 +754,17 @@ class OpenRouterDocumentExtractor:
 
         if ExtractionType.Metadata in requested_types:
             raw_metadata = payload.get("metadata")
-            metadata = self._parse_metadata(raw_metadata)
+            if self.company_type == CompanyType.GENERIC:
+                metadata = self._parse_company_metadata(raw_metadata)
+            else:
+                metadata = self._parse_metadata(raw_metadata)
 
         if ExtractionType.Governance in requested_types:
             raw_governance = payload.get("governance")
-            governance = self._parse_governance(raw_governance)
+            if self.company_type == CompanyType.GENERIC:
+                governance = self._parse_company_governance(raw_governance)
+            else:
+                governance = self._parse_governance(raw_governance)
 
         if ExtractionType.StatementOfFinancialActivities in requested_types:
             raw_sofa = payload.get("statement_of_financial_activities")
@@ -1006,6 +1018,24 @@ class OpenRouterDocumentExtractor:
             raise DocumentExtractionError("Expected `governance` to be an object")
         try:
             return Governance.model_validate(raw_governance)
+        except ValidationError as exc:
+            raise DocumentExtractionError(f"Invalid governance payload: {exc}") from exc
+
+    @staticmethod
+    def _parse_company_metadata(raw_metadata: Any) -> CompanyMetadata:
+        if not isinstance(raw_metadata, dict):
+            raise DocumentExtractionError("Expected `metadata` to be an object")
+        try:
+            return CompanyMetadata.model_validate(raw_metadata)
+        except ValidationError as exc:
+            raise DocumentExtractionError(f"Invalid metadata payload: {exc}") from exc
+
+    @staticmethod
+    def _parse_company_governance(raw_governance: Any) -> CompanyGovernance:
+        if not isinstance(raw_governance, dict):
+            raise DocumentExtractionError("Expected `governance` to be an object")
+        try:
+            return CompanyGovernance.model_validate(raw_governance)
         except ValidationError as exc:
             raise DocumentExtractionError(f"Invalid governance payload: {exc}") from exc
 

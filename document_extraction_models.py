@@ -378,8 +378,8 @@ class ExtractionResult(BaseModel):
     requested_types: list[ExtractionType]
     personnel_details: list[PersonnelDetail] | None = None
     balance_sheet: list[BalanceSheetEntry] | None = None
-    metadata: Metadata | None = None
-    governance: Governance | None = None
+    metadata: Metadata | CompanyMetadata | None = None
+    governance: Governance | CompanyGovernance | None = None
     statement_of_financial_activities: StatementOfFinancialActivities | None = None
     detailed_balance_sheet: DetailedBalanceSheet | None = None
     staffing_data: StaffingData | None = None
