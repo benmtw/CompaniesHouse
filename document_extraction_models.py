@@ -321,10 +321,13 @@ class CompanyMetadata(BaseModel):
 
     @field_validator("company_registration_number")
     @classmethod
-    def _company_number_must_be_8_digits(cls, value: str) -> str:
-        if len(value) != 8 or not value.isdigit():
-            raise ValueError("must be an 8-digit company number")
-        return value
+    def _company_number_must_be_valid_uk_format(cls, value: str) -> str:
+        normalized = value.upper()
+        if not re.fullmatch(r"(?:\d{8}|[A-Z]{2}\d{6})", normalized):
+            raise ValueError(
+                "must be an 8-digit number or a 2-letter prefix followed by 6 digits"
+            )
+        return normalized
 
 
 class DirectorAttendance(BaseModel):

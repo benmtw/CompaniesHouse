@@ -541,7 +541,7 @@ class OpenRouterDocumentExtractor:
                 "company_name": {"type": "string"},
                 "company_registration_number": {
                     "type": "string",
-                    "pattern": "^[0-9]{8}$",
+                    "pattern": "^(?:[0-9]{8}|[A-Za-z]{2}[0-9]{6})$",
                 },
                 "financial_year_ending": {"type": "string", "format": "date"},
                 "accounting_officer": {"type": ["string", "null"]},

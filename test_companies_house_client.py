@@ -968,6 +968,50 @@ class OpenRouterDocumentExtractorTests(unittest.TestCase):
         report_props = schema["properties"]["annual_report"]["properties"]
         self.assertIn("company_name", report_props["metadata"]["properties"])
         self.assertIn("directors", report_props["governance"]["properties"])
+        self.assertEqual(
+            report_props["metadata"]["properties"]["company_registration_number"]["pattern"],
+            "^(?:[0-9]{8}|[A-Za-z]{2}[0-9]{6})$",
+        )
+
+    def test_extract_generic_annual_report_accepts_prefixed_company_number(self):
+        extractor = OpenRouterDocumentExtractor(
+            api_key="or_key", company_type=CompanyType.GENERIC
+        )
+        llm_json = """
+        {
+          "annual_report": {
+            "metadata": {
+              "company_name": "ACME SCOTLAND LTD",
+              "company_registration_number": "sc123456",
+              "financial_year_ending": "2024-12-31",
+              "accounting_officer": "John Doe"
+            },
+            "governance": {"directors": []},
+            "statement_of_financial_activities": {"income": {}, "expenditure": {}},
+            "balance_sheet": {
+              "fixed_assets": null,
+              "current_assets": null,
+              "liabilities": null,
+              "net_assets": null
+            },
+            "staffing_data": {"average_headcount_fte": null, "total_staff_costs": null, "high_pay_bands": []}
+          }
+        }
+        """
+        response = {"choices": [{"message": {"content": llm_json}}]}
+        extractor._post_openrouter_chat_completion = Mock(return_value=response)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "full_accounts.txt")
+            with open(path, "w", encoding="utf-8") as fh:
+                fh.write("Sample full accounts text")
+
+            result = extractor.extract(path, extraction_types=[ExtractionType.AnnualReport])
+
+        self.assertEqual(
+            result.annual_report.metadata.company_registration_number,
+            "SC123456",
+        )
 
     def test_generic_company_type_prompts_use_company_terms(self):
         _, user_prompt = OpenRouterDocumentExtractor._build_prompts(
