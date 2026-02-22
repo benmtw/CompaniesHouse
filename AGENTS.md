@@ -45,6 +45,8 @@ Expected usage:
 - `test_companies_house_client.py`
 - `COMPANIES_HOUSE_API.md`
 - `AGENTS.md`
+- `CLAUDE.md`
+- `Prefect.md`
 
 ## Operational Notes
 - Follow `COMPANIES_HOUSE_API.md` as the API contract reference.

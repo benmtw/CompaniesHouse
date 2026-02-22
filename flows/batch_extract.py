@@ -1,14 +1,15 @@
 """Prefect flows for batch extraction of Companies House filings.
 
-Phase 1: Sequential processing with Prefect observability.
-Keeps existing rate limiting and SQLite persistence unchanged.
+Phase 2: Adds Prefect-native rate limiting, Secret blocks for API keys,
+and on_failure notification hook. Rate limiting is handled by Prefect
+global concurrency limits via rate_limit() in task modules.
 """
 
 import json
+import logging
 import math
 import os
 import sqlite3
-import time
 import traceback
 from datetime import UTC, datetime
 from pathlib import Path
@@ -84,34 +85,6 @@ def _parse_fallback_models(raw_models: str) -> list[str]:
         seen.add(model)
         out.append(model)
     return out
-
-
-def _install_companies_house_request_throttle(
-    client: CompaniesHouseClient, min_interval_seconds: float
-) -> dict[str, Any]:
-    state: dict[str, Any] = {
-        "enabled": min_interval_seconds > 0,
-        "min_interval_seconds": min_interval_seconds,
-        "request_count": 0,
-    }
-    if min_interval_seconds <= 0:
-        return state
-
-    original_request = client.session.request
-    request_state = {"last_request_ts": 0.0}
-
-    def throttled_request(*args: Any, **kwargs: Any) -> Any:
-        now = time.monotonic()
-        elapsed = now - request_state["last_request_ts"]
-        wait = min_interval_seconds - elapsed
-        if wait > 0:
-            time.sleep(wait)
-        request_state["last_request_ts"] = time.monotonic()
-        state["request_count"] += 1
-        return original_request(*args, **kwargs)
-
-    client.session.request = throttled_request
-    return state
 
 
 def _insert_failed_company_row(
@@ -233,9 +206,41 @@ def process_company_flow(
     return result
 
 
+def _load_secret(block_name: str, env_var: str) -> str:
+    """Load a secret from Prefect Secret block, falling back to environment variable."""
+    try:
+        from prefect.blocks.system import Secret
+
+        secret = Secret.load(block_name)
+        if secret:
+            return secret.get()
+    except Exception:
+        pass
+    # Fallback: load from .env / environment
+    from batch_extract_companies import _load_dotenv_file
+
+    _load_dotenv_file(Path(".env"))
+    return os.getenv(env_var, "").strip()
+
+
+def _notify_on_failure(flow, flow_run, state):
+    """Log a prominent failure message on flow failure.
+
+    Full notification integrations (email, Slack, webhook) can be configured
+    via Prefect Automations in the UI.
+    """
+    logger = logging.getLogger("prefect.flow_runs")
+    logger.error(
+        "Flow '%s' failed. Run ID: %s. Check the Prefect UI for details.",
+        flow.name,
+        flow_run.id,
+    )
+
+
 @flow(
     name="batch-extract-companies",
     log_prints=True,
+    on_failure=[_notify_on_failure],
 )
 def batch_extract_companies_flow(
     input_xlsx: str = DEFAULT_INPUT_XLSX,
@@ -247,7 +252,6 @@ def batch_extract_companies_flow(
     company_type: str = "generic",
     db_path: str = "",
     fallback_models: str = "",
-    ch_min_request_interval_seconds: float = 2.0,
     write_summary_json: bool = False,
     summary_json_path: str = "",
     filing_history_items_per_page: int = 100,
@@ -258,21 +262,26 @@ def batch_extract_companies_flow(
     """Top-level Prefect flow for batch extraction of Companies House filings.
 
     Orchestrates: load batch -> initialize run -> process each company -> finalize.
+
+    Rate limiting is handled by Prefect global concurrency limits. Before running,
+    create the limit:
+
+        prefect gcl create companies-house-api --limit 1 --slot-decay-per-second 0.5
+
+    API keys are loaded from Prefect Secret blocks (companies-house-api-key,
+    openrouter-api-key) with fallback to environment variables / .env file.
     """
-    # Load .env for API keys if not already in environment
-    from batch_extract_companies import _load_dotenv_file
-
-    _load_dotenv_file(Path(".env"))
-
-    # Resolve API keys
-    ch_api_key = os.getenv("CH_API_KEY")
+    # Resolve API keys (Secret blocks with .env fallback)
+    ch_api_key = _load_secret("companies-house-api-key", "CH_API_KEY")
     if not ch_api_key:
-        raise ValueError("Missing CH_API_KEY. Set in environment or .env.")
-    openrouter_api_key = os.getenv("OPENROUTER_API_KEY")
+        raise ValueError("Missing CH_API_KEY. Set as Prefect Secret block or in .env.")
+    openrouter_api_key = _load_secret("openrouter-api-key", "OPENROUTER_API_KEY")
     if not openrouter_api_key:
-        raise ValueError("Missing OPENROUTER_API_KEY. Set in environment or .env.")
+        raise ValueError(
+            "Missing OPENROUTER_API_KEY. Set as Prefect Secret block or in .env."
+        )
 
-    resolved_model = model or os.getenv("OPENROUTER_MODEL", "").strip()
+    resolved_model = model or _load_secret("openrouter-model", "OPENROUTER_MODEL")
     if not resolved_model:
         raise ValueError(
             "Missing model. Set OPENROUTER_MODEL in .env or pass model parameter."
@@ -321,14 +330,10 @@ def batch_extract_companies_flow(
     print(f"[run {run_id}] schema_profile={schema_profile}")
     print(f"[run {run_id}] company_type={ct.value}")
 
-    # Create CH client with throttle
+    # Create CH client (rate limiting handled by Prefect global concurrency limits)
     client = CompaniesHouseClient(api_key=ch_api_key)
-    throttle_state = _install_companies_house_request_throttle(
-        client=client,
-        min_interval_seconds=ch_min_request_interval_seconds,
-    )
 
-    # Process companies sequentially (Phase 1)
+    # Process companies sequentially
     processed = 0
     succeeded = 0
     failed = 0
@@ -429,13 +434,7 @@ def batch_extract_companies_flow(
             "model_candidates": model_candidates,
             "schema_profile": schema_profile,
             "requested_types": [t.value for t in extraction_types],
-            "companies_house_min_request_interval_seconds": ch_min_request_interval_seconds,
-            "estimated_companies_house_rate_requests_per_second": (
-                (1.0 / ch_min_request_interval_seconds)
-                if ch_min_request_interval_seconds > 0
-                else None
-            ),
-            "companies_house_request_count": throttle_state["request_count"],
+            "rate_limiting": "prefect-global-concurrency-limit",
             "total_companies": total_companies,
             "processed": processed,
             "succeeded": succeeded,
