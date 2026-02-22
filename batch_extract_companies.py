@@ -663,6 +663,11 @@ def build_parser() -> argparse.ArgumentParser:
             "compact_single_call minimizes nesting while keeping broad coverage."
         ),
     )
+    parser.add_argument(
+        "--use-prefect",
+        action="store_true",
+        help="Run as a Prefect flow instead of the legacy sequential script",
+    )
     return parser
 
 
@@ -1053,5 +1058,36 @@ def main() -> int:
     return 0
 
 
+def main_prefect() -> int:
+    """Entry point that delegates to the Prefect flow."""
+    _load_dotenv_file(Path(".env"))
+    args = build_parser().parse_args()
+
+    from flows.batch_extract import batch_extract_companies_flow
+
+    result = batch_extract_companies_flow(
+        input_xlsx=args.input_xlsx,
+        output_root=args.output_root,
+        model=args.model,
+        max_companies=args.max_companies,
+        start_index=args.start_index,
+        schema_profile=args.schema_profile,
+        company_type=args.company_type,
+        db_path=args.db_path,
+        fallback_models=args.fallback_models,
+        ch_min_request_interval_seconds=args.ch_min_request_interval_seconds,
+        write_summary_json=args.write_summary_json,
+        summary_json_path=args.summary_json_path,
+        filing_history_items_per_page=args.filing_history_items_per_page,
+        retries_on_invalid_json=args.retries_on_invalid_json,
+        random_sample_size=args.random_sample_size,
+        random_seed=args.random_seed,
+    )
+    return 0 if result.get("failed", 0) == 0 else 1
+
+
 if __name__ == "__main__":
+    args = build_parser().parse_args()
+    if args.use_prefect:
+        raise SystemExit(main_prefect())
     raise SystemExit(main())
