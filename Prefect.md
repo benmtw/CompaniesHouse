@@ -23,15 +23,17 @@ Alternatively, store secrets as Prefect Secret blocks (see [Secrets Management](
 
 ## Quick Start
 
-### 1. Set up rate limiting
+### 1. Set up concurrency limits
 
-Create the Prefect global concurrency limit for Companies House API rate limiting:
+Create the Prefect global concurrency limits for API rate limiting:
 
 ```bash
+# Companies House API: max 0.5 req/sec (one request every 2 seconds)
 prefect gcl create companies-house-api --limit 1 --slot-decay-per-second 0.5
-```
 
-This enforces a maximum of 0.5 requests/second (one request every 2 seconds).
+# OpenRouter LLM API: max 3 concurrent extraction calls
+prefect gcl create openrouter-llm --limit 3
+```
 
 ### 2. Run the flow directly
 
@@ -73,22 +75,24 @@ batch_extract_companies_flow (top-level flow)
     |       Read XLSX, deduplicate company numbers, apply slicing/sampling
     |
     |-- initialize_run (task)
-    |       Create output dirs, SQLite tables, insert run row
+    |       Create output dirs, SQLite tables (WAL mode), insert run row
     |
-    |-- FOR EACH company:
+    |-- CONCURRENT (ThreadPoolExecutor, max_concurrent_companies workers):
     |       process_company_flow (subflow, one per company)
-    |           |-- fetch_company_profile (task)
-    |           |-- fetch_filing_history (task)
+    |           |-- fetch_company_profile (task)    [rate_limit: companies-house-api]
+    |           |-- fetch_filing_history (task)     [rate_limit: companies-house-api]
     |           |-- find_latest_full_accounts (task)
-    |           |-- download_document (task)
-    |           |-- extract_document (task)
+    |           |-- download_document (task)        [rate_limit: companies-house-api]
+    |           |-- extract_document (task)         [rate_limit: openrouter-llm]
     |           |-- save_results (task)
     |
     |-- finalize_run (task)
             Update run totals, mark finished
 ```
 
-Each company is processed as a **subflow**, giving first-class observability in the Prefect UI: individual status, duration, and logs per company.
+Companies are processed **concurrently** via a `ThreadPoolExecutor` controlled by the `max_concurrent_companies` parameter (default 4). Each company subflow gets its own `CompaniesHouseClient` instance for thread safety. Rate limiting is enforced at the task level by Prefect global concurrency limits, which properly serialize API access across concurrent subflows.
+
+Each company appears as its own **subflow** in the Prefect UI with individual status, duration, and logs.
 
 ---
 
@@ -111,6 +115,7 @@ Each company is processed as a **subflow**, giving first-class observability in 
 | `retries_on_invalid_json` | int | `2` | Number of retries when LLM returns invalid JSON |
 | `random_sample_size` | int | `0` | Randomly sample this many companies (0 = disabled) |
 | `random_seed` | int | `0` | Seed for random sampling (0 = random) |
+| `max_concurrent_companies` | int | `4` | Max companies processed in parallel (1 = sequential) |
 
 ---
 
@@ -200,17 +205,23 @@ The top-level flow has an `on_failure` hook that logs a prominent error message.
 
 ---
 
-## Rate Limiting
+## Rate Limiting & Concurrency
 
-Companies House API rate limiting is enforced via Prefect global concurrency limits. Each API task calls `rate_limit("companies-house-api")` before making an HTTP request.
+Two Prefect global concurrency limits control external API access across all concurrent subflows:
+
+| Limit | Purpose | Tasks |
+|---|---|---|
+| `companies-house-api` | Rate-limit CH API to 0.5 req/sec | `fetch_company_profile`, `fetch_filing_history`, `download_document` |
+| `openrouter-llm` | Cap concurrent LLM extractions at 3 | `extract_document` |
 
 ### Setup (required before first run)
 
 ```bash
 prefect gcl create companies-house-api --limit 1 --slot-decay-per-second 0.5
+prefect gcl create openrouter-llm --limit 3
 ```
 
-This limits API requests to one every 2 seconds (0.5 req/sec), matching the Companies House API rate limit of 600 requests per 5 minutes.
+The `companies-house-api` limit enforces one request every 2 seconds (0.5 req/sec), matching the Companies House API rate limit. The `openrouter-llm` limit caps concurrent LLM calls at 3 to control costs. Adjust the OpenRouter limit based on your budget and provider rate limits.
 
 ### Verify
 
@@ -282,9 +293,10 @@ output/companies_extraction/
 
 ### "No global concurrency limit found"
 
-Create the rate limit before running:
+Create the concurrency limits before running:
 ```bash
 prefect gcl create companies-house-api --limit 1 --slot-decay-per-second 0.5
+prefect gcl create openrouter-llm --limit 3
 ```
 
 ### "Missing CH_API_KEY" or "Missing OPENROUTER_API_KEY"

@@ -148,7 +148,9 @@ def initialize_run(
 
     resolved_db_path = Path(db_path) if db_path else output_root_path / DEFAULT_DB_NAME
     _ensure_parent(resolved_db_path)
-    conn = sqlite3.connect(resolved_db_path)
+    conn = sqlite3.connect(resolved_db_path, timeout=10)
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA busy_timeout=5000")
     _create_tables(conn)
 
     cursor = conn.execute(

@@ -3,6 +3,7 @@
 from typing import Any
 
 from prefect import task
+from prefect.concurrency.sync import rate_limit
 
 from companies_house_client import CompaniesHouseClient
 from company_type import CompanyType
@@ -126,6 +127,7 @@ def extract_document(
     """
     from batch_extract_companies import _extraction_types_for_schema_profile
 
+    rate_limit("openrouter-llm")
     try:
         payload, warnings, model_used = _extract_with_model_fallback(
             api_key=openrouter_api_key,

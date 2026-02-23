@@ -1,8 +1,9 @@
 """Prefect flows for batch extraction of Companies House filings.
 
-Phase 2: Adds Prefect-native rate limiting, Secret blocks for API keys,
-and on_failure notification hook. Rate limiting is handled by Prefect
-global concurrency limits via rate_limit() in task modules.
+Phase 3: Adds concurrent company processing via ThreadPoolExecutor.
+Multiple companies are processed in parallel, with rate limiting enforced
+by Prefect global concurrency limits for both Companies House API and
+OpenRouter LLM calls. SQLite uses WAL mode for concurrent write safety.
 """
 
 import json
@@ -11,6 +12,7 @@ import math
 import os
 import sqlite3
 import traceback
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -94,7 +96,7 @@ def _insert_failed_company_row(
     company_number: str,
     error_message: str,
 ) -> None:
-    conn = sqlite3.connect(db_path)
+    conn = sqlite3.connect(db_path, timeout=10)
     conn.execute(
         """
         INSERT INTO company_reports (
@@ -258,15 +260,20 @@ def batch_extract_companies_flow(
     retries_on_invalid_json: int = 2,
     random_sample_size: int = 0,
     random_seed: int = 0,
+    max_concurrent_companies: int = 4,
 ) -> dict:
     """Top-level Prefect flow for batch extraction of Companies House filings.
 
-    Orchestrates: load batch -> initialize run -> process each company -> finalize.
+    Orchestrates: load batch -> initialize run -> process companies concurrently -> finalize.
+
+    Companies are processed in parallel using a ThreadPoolExecutor controlled by
+    ``max_concurrent_companies`` (default 4). Set to 1 for sequential processing.
 
     Rate limiting is handled by Prefect global concurrency limits. Before running,
-    create the limit:
+    create the limits:
 
         prefect gcl create companies-house-api --limit 1 --slot-decay-per-second 0.5
+        prefect gcl create openrouter-llm --limit 3
 
     API keys are loaded from Prefect Secret blocks (companies-house-api-key,
     openrouter-api-key) with fallback to environment variables / .env file.
@@ -330,24 +337,22 @@ def batch_extract_companies_flow(
     print(f"[run {run_id}] schema_profile={schema_profile}")
     print(f"[run {run_id}] company_type={ct.value}")
 
-    # Create CH client (rate limiting handled by Prefect global concurrency limits)
-    client = CompaniesHouseClient(api_key=ch_api_key)
-
-    # Process companies sequentially
+    # Process companies concurrently (rate limiting handled by Prefect GCL)
     processed = 0
     succeeded = 0
     failed = 0
     company_summaries: list[dict[str, Any]] = []
 
-    for item in batch:
-        processed += 1
-        company_number = item["company_number"]
-        prefix = f"[run {run_id}] [{processed}/{total_companies}] {company_number}"
-        print(f"{prefix} start")
+    print(f"[run {run_id}] max_concurrent_companies={max_concurrent_companies}")
 
-        try:
-            result = process_company_flow(
-                client=client,
+    with ThreadPoolExecutor(max_workers=max_concurrent_companies) as executor:
+        futures: dict[Any, dict] = {}
+        for item in batch:
+            # Create a separate CH client per subflow -- requests.Session is not thread-safe
+            thread_client = CompaniesHouseClient(api_key=ch_api_key)
+            future = executor.submit(
+                process_company_flow,
+                client=thread_client,
                 openrouter_api_key=openrouter_api_key,
                 model_candidates=model_candidates,
                 model_requested=resolved_model,
@@ -361,50 +366,59 @@ def batch_extract_companies_flow(
                 retries_on_invalid_json=retries_on_invalid_json,
                 filing_history_items_per_page=filing_history_items_per_page,
             )
-            succeeded += 1
-            company_summaries.append(
-                {
-                    "source_row_index": item["source_row_index"],
-                    "group_uid": item.get("group_uid"),
-                    "group_id": item.get("group_id"),
-                    "group_name": item.get("group_name"),
-                    "company_number": company_number,
-                    "status": "success",
-                    "company_name": result.get("company_name"),
-                    "document_id": result.get("document_id"),
-                    "pdf_path": result.get("pdf_path"),
-                    "model_used": result.get("model_used"),
-                    "error": None,
-                }
-            )
-            print(
-                f"{prefix} success document_id={result.get('document_id')} "
-                f"model={result.get('model_used')}"
-            )
-        except Exception as exc:
-            failed += 1
-            error_message = "".join(
-                traceback.format_exception(exc.__class__, exc, exc.__traceback__)
-            )[:MAX_ERROR_TRACEBACK_CHARS]
-            _insert_failed_company_row(
-                db_path=resolved_db_path,
-                run_id=run_id,
-                item=item,
-                company_number=company_number,
-                error_message=error_message,
-            )
-            company_summaries.append(
-                {
-                    "source_row_index": item["source_row_index"],
-                    "group_uid": item.get("group_uid"),
-                    "group_id": item.get("group_id"),
-                    "group_name": item.get("group_name"),
-                    "company_number": company_number,
-                    "status": "failed",
-                    "error": str(exc),
-                }
-            )
-            print(f"{prefix} failed error={exc}")
+            futures[future] = item
+
+        for future in as_completed(futures):
+            processed += 1
+            item = futures[future]
+            company_number = item["company_number"]
+            prefix = f"[run {run_id}] [{processed}/{total_companies}] {company_number}"
+            try:
+                result = future.result()
+                succeeded += 1
+                company_summaries.append(
+                    {
+                        "source_row_index": item["source_row_index"],
+                        "group_uid": item.get("group_uid"),
+                        "group_id": item.get("group_id"),
+                        "group_name": item.get("group_name"),
+                        "company_number": company_number,
+                        "status": "success",
+                        "company_name": result.get("company_name"),
+                        "document_id": result.get("document_id"),
+                        "pdf_path": result.get("pdf_path"),
+                        "model_used": result.get("model_used"),
+                        "error": None,
+                    }
+                )
+                print(
+                    f"{prefix} success document_id={result.get('document_id')} "
+                    f"model={result.get('model_used')}"
+                )
+            except Exception as exc:
+                failed += 1
+                error_message = "".join(
+                    traceback.format_exception(exc.__class__, exc, exc.__traceback__)
+                )[:MAX_ERROR_TRACEBACK_CHARS]
+                _insert_failed_company_row(
+                    db_path=resolved_db_path,
+                    run_id=run_id,
+                    item=item,
+                    company_number=company_number,
+                    error_message=error_message,
+                )
+                company_summaries.append(
+                    {
+                        "source_row_index": item["source_row_index"],
+                        "group_uid": item.get("group_uid"),
+                        "group_id": item.get("group_id"),
+                        "group_name": item.get("group_name"),
+                        "company_number": company_number,
+                        "status": "failed",
+                        "error": str(exc),
+                    }
+                )
+                print(f"{prefix} failed error={exc}")
 
     # Finalize run
     finalize_run(

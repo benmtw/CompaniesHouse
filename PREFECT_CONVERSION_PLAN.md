@@ -589,12 +589,12 @@ deployments:
 
 **Benefit**: Better error handling, secrets management, scheduling.
 
-### Phase 3: Enable Concurrency
+### Phase 3: Enable Concurrency ✅ (Implemented)
 
-1. Use `.submit()` to process multiple companies in parallel
-2. Configure tag-based concurrency limits for CH API and OpenRouter
-3. Consider switching SQLite to PostgreSQL for concurrent writes
-4. Tune `ThreadPoolTaskRunner(max_workers=N)` based on rate limits
+1. ~~Use `.submit()` to process multiple companies in parallel~~ → Used `ThreadPoolExecutor` with `max_concurrent_companies` parameter (default 4) for concurrent subflow execution
+2. ✅ Configured Prefect global concurrency limits: `companies-house-api` (rate limit) and `openrouter-llm` (concurrency cap of 3)
+3. ~~Consider switching SQLite to PostgreSQL~~ → Kept SQLite with WAL mode + `busy_timeout` for concurrent write safety
+4. ✅ Concurrency controlled via `max_concurrent_companies` flow parameter; each subflow gets its own `CompaniesHouseClient` for thread safety
 
 **Benefit**: Faster batch processing while respecting external rate limits.
 

@@ -85,7 +85,7 @@ def save_results(
     write_json(warnings_path, warnings_payload)
     write_json(run_report_path, run_report)
 
-    conn = sqlite3.connect(db_path)
+    conn = sqlite3.connect(db_path, timeout=10)
     conn.execute(
         """
         INSERT INTO company_reports (
