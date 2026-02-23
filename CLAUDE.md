@@ -28,6 +28,10 @@ Companies House data extraction pipeline. Batch processes company filings from X
 
 Archived documentation (completed plans, incident reports, legacy scripts) is in `docs/archive/`.
 
+## Default Company Type
+
+Always use `--company-type academy_trust` when running batch extractions. This is the default. The academy trust prompts extract `organisation_name` and `organisation_type` fields which name enrichment depends on. Using `generic` mode with enrichment enabled will produce a warning.
+
 ## Documentation Maintenance Rules
 
 - When modifying Prefect flows, tasks, parameters, or deployments in `flows/` or `prefect.yaml`, **update `docs/Prefect.md`** in the same commit

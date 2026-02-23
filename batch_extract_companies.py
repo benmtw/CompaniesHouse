@@ -249,10 +249,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--company-type",
         choices=[ct.value for ct in CompanyType],
-        default=CompanyType.GENERIC.value,
+        default=CompanyType.ACADEMY_TRUST.value,
         help=(
             "Type of company being processed. Controls LLM prompt text and "
-            "extraction model fields (default: generic)"
+            "extraction model fields (default: academy_trust)"
         ),
     )
     parser.add_argument(
@@ -560,6 +560,14 @@ def main() -> int:
         raise ValueError("retries_on_invalid_json must be >= 0")
 
     company_type = CompanyType(args.company_type)
+
+    if not args.no_name_enrichment and company_type != CompanyType.ACADEMY_TRUST:
+        print(
+            "WARNING: Name enrichment is enabled but --company-type is not 'academy_trust'.\n"
+            "  The academy_trust prompts extract organisation_type which enrichment uses.\n"
+            "  Consider using --company-type academy_trust or --no-name-enrichment.",
+            flush=True,
+        )
 
     output_root = Path(args.output_root)
     run_stamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")

@@ -10,6 +10,8 @@ import re
 from pathlib import Path
 from typing import Any
 
+from nameparser import HumanName
+
 logger = logging.getLogger(__name__)
 
 DEFAULT_ENRICHMENT_CACHE_DIR = "output/enrichment_cache"
@@ -72,18 +74,15 @@ def enrich_personnel_names(
 
     cache_path = Path(cache_dir) if cache_dir else Path(DEFAULT_ENRICHMENT_CACHE_DIR)
 
-    # Identify indices that need enrichment
+    # Identify indices that need enrichment — any personnel with incomplete first names
     indices_to_enrich: list[int] = []
     for idx, person in enumerate(personnel):
-        org_type = (person.get("organisation_type") or "").strip().lower()
-        if org_type != "trust":
-            continue
         first_name = (person.get("first_name") or "").strip()
         if first_name and _is_incomplete_first_name(first_name):
             indices_to_enrich.append(idx)
 
     if not indices_to_enrich:
-        logger.info("No incomplete trust-level names to enrich")
+        logger.info("No incomplete names to enrich")
         return personnel
 
     logger.info(
@@ -142,73 +141,112 @@ def enrich_personnel_names(
 
         predict = dspy.Predict(PersonLookup, tools=[{"googleSearch": {}}])
 
-    for idx in indices_to_enrich:
+    # --- Resolve all uncached lookups concurrently ---
+    def _lookup(idx: int) -> tuple[int, str | None, str | None, str]:
+        """Return (idx, full_first_name, email, source)."""
         person = personnel[idx]
         first_name = (person.get("first_name") or "").strip()
         last_name = (person.get("last_name") or "").strip()
         job_title = (person.get("job_title") or "").strip()
 
-        # Preserve the original LLM-extracted name
-        person["first_name_extracted"] = first_name
-
         key = _cache_key(company_name, first_name, last_name, job_title)
         cached = _read_cache(cache_path, key)
 
         if cached is not None:
-            full_first = cached.get("full_first_name")
-            email = cached.get("email")
-            source = "cache"
-        else:
-            try:
-                result = predict(
-                    company_name=company_name,
-                    first_name_initial=first_name,
-                    last_name=last_name,
-                    job_title=job_title,
-                )
-                full_first = getattr(result, "full_first_name", "UNKNOWN") or "UNKNOWN"
-                email = getattr(result, "email", "UNKNOWN") or "UNKNOWN"
+            return idx, cached.get("full_first_name"), cached.get("email"), "cache"
 
-                if full_first.upper() == "UNKNOWN":
-                    full_first = None
-                if email.upper() == "UNKNOWN":
-                    email = None
+        try:
+            result = predict(
+                company_name=company_name,
+                first_name_initial=first_name,
+                last_name=last_name,
+                job_title=job_title,
+            )
+            full_first = getattr(result, "full_first_name", "UNKNOWN") or "UNKNOWN"
+            email_val = getattr(result, "email", "UNKNOWN") or "UNKNOWN"
 
-                _write_cache(cache_path, key, {
-                    "company_name": company_name,
-                    "first_name_initial": first_name,
-                    "last_name": last_name,
-                    "job_title": job_title,
-                    "full_first_name": full_first,
-                    "email": email,
-                })
-                source = "api"
-            except Exception:
-                logger.warning(
-                    "Failed to enrich '%s %s' — keeping original",
-                    first_name,
-                    last_name,
-                    exc_info=True,
-                )
-                person["first_name_enriched"] = None
-                continue
+            if full_first.upper() == "UNKNOWN":
+                full_first = None
+            if email_val.upper() == "UNKNOWN":
+                email_val = None
+
+            _write_cache(cache_path, key, {
+                "company_name": company_name,
+                "first_name_initial": first_name,
+                "last_name": last_name,
+                "job_title": job_title,
+                "full_first_name": full_first,
+                "email": email_val,
+            })
+            return idx, full_first, email_val, "api"
+        except Exception:
+            logger.warning(
+                "Failed to enrich '%s %s' — keeping original",
+                first_name,
+                last_name,
+                exc_info=True,
+            )
+            return idx, None, None, "error"
+
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+
+    max_workers = 10
+    results: dict[int, tuple[str | None, str | None, str]] = {}
+    total = len(indices_to_enrich)
+    done_count = 0
+
+    with ThreadPoolExecutor(max_workers=max_workers) as pool:
+        futures = {pool.submit(_lookup, idx): idx for idx in indices_to_enrich}
+        for future in as_completed(futures):
+            idx, full_first, email_val, source = future.result()
+            results[idx] = (full_first, email_val, source)
+            done_count += 1
+            person = personnel[idx]
+            fn = (person.get("first_name") or "").strip()
+            ln = (person.get("last_name") or "").strip()
+            resolved = full_first or "—"
+            logger.info(
+                "[%d/%d] %s %s -> %s (%s)",
+                done_count, total, fn, ln, resolved, source,
+            )
+
+    # --- Apply results back to personnel list ---
+    for idx in indices_to_enrich:
+        person = personnel[idx]
+        first_name = (person.get("first_name") or "").strip()
+
+        # Preserve the original LLM-extracted name
+        person["first_name_extracted"] = first_name
+
+        full_first, email_val, source = results[idx]
+
+        if source == "error":
+            person["first_name_enriched"] = None
+            continue
 
         if full_first and len(full_first) > len(re.sub(r"[.\s]", "", first_name)):
+            # Parse the enriched name to separate first from middle names
+            parsed = HumanName(f"{full_first} {person.get('last_name', '')}")
+            parsed_first = str(parsed.first).strip()
+            parsed_middle = str(parsed.middle).strip()
+
             logger.info(
                 "Resolved '%s %s' -> '%s %s' [%s]",
                 first_name,
-                last_name,
-                full_first,
-                last_name,
+                person.get("last_name", ""),
+                parsed_first,
+                person.get("last_name", ""),
                 source,
             )
-            person["first_name_enriched"] = full_first
-            person["first_name"] = full_first
+            person["first_name_enriched"] = parsed_first
+            person["first_name"] = parsed_first
+            if parsed_middle:
+                person["middle_names"] = parsed_middle
         else:
             person["first_name_enriched"] = None
 
-        if email:
-            person["email"] = email
+        if email_val:
+            person["email"] = email_val
         else:
             person.setdefault("email", None)
 

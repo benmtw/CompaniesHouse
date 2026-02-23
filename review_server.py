@@ -373,22 +373,29 @@ def _render_extraction(extraction_json_raw):
     if personnel and isinstance(personnel, list):
         parts.append("<h3>Personnel Details</h3>")
         parts.append('<table class="personnel-table"><thead><tr>'
-                     "<th>Name</th><th>First (Extracted)</th><th>First (Enriched)</th>"
+                     "<th>Original Name</th>"
+                     "<th>First</th><th>Middle</th><th>Last</th>"
+                     "<th>First (Extracted)</th><th>First (Enriched)</th>"
                      "<th>Job Title</th><th>Standardised Title</th>"
-                     "<th>Organisation</th><th>Email</th></tr></thead><tbody>")
+                     "<th>Organisation</th><th>Email</th><th>Email Source</th></tr></thead><tbody>")
         for p in personnel:
-            first = p.get("first_name", "")
+            extracted_first = p.get("first_name_extracted") or p.get("first_name", "")
             last = p.get("last_name", "")
+            original = f"{extracted_first} {last}".strip()
+            first = p.get("first_name", "")
+            middle = p.get("middle_names", "") or ""
             extracted = p.get("first_name_extracted", "") or ""
             enriched = p.get("first_name_enriched", "") or ""
             title = p.get("job_title", "")
             std = p.get("standardised_job_title", "") or ""
             org = p.get("organisation_name", "") or ""
             email = p.get("email", "") or ""
-            parts.append(f"<tr><td>{first} {last}</td>"
+            email_source = "gemini" if email else ""
+            parts.append(f"<tr><td>{original}</td>"
+                         f"<td>{first}</td><td>{middle}</td><td>{last}</td>"
                          f"<td>{extracted}</td><td>{enriched}</td>"
                          f"<td>{title}</td><td>{std}</td>"
-                         f"<td>{org}</td><td>{email}</td></tr>")
+                         f"<td>{org}</td><td>{email}</td><td>{email_source}</td></tr>")
         parts.append("</tbody></table>")
 
     # Metadata
