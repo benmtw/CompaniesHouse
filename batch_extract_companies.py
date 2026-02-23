@@ -1,5 +1,6 @@
 import argparse
 import json
+import logging
 import os
 import queue
 import random
@@ -14,6 +15,24 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 from zipfile import ZipFile
+
+LOG_DIR = Path("logs")
+LOG_DIR.mkdir(exist_ok=True)
+
+log = logging.getLogger("batch_extract")
+log.setLevel(logging.DEBUG)
+
+# File handler — always writes to logs/batch_extract.log
+_fh = logging.FileHandler(LOG_DIR / "batch_extract.log", encoding="utf-8")
+_fh.setLevel(logging.DEBUG)
+_fh.setFormatter(logging.Formatter("%(asctime)s %(levelname)-7s %(message)s", datefmt="%Y-%m-%d %H:%M:%S"))
+log.addHandler(_fh)
+
+# Console handler — mirrors to stdout
+_ch = logging.StreamHandler()
+_ch.setLevel(logging.INFO)
+_ch.setFormatter(logging.Formatter("%(asctime)s %(levelname)-7s %(message)s", datefmt="%H:%M:%S"))
+log.addHandler(_ch)
 
 from companies_house_client import CompaniesHouseClient
 from company_type import CompanyType
@@ -456,10 +475,10 @@ def _run_personnel_mode(args: argparse.Namespace, input_xlsx: Path, ch_api_key: 
         min_interval_seconds=args.ch_min_request_interval_seconds,
     )
 
-    print(f"[personnel] output_dir={output_run_dir}")
-    print(f"[personnel] cache_dir={cache_dir}")
-    print(f"[personnel] cache_ttl_days={ttl_days}")
-    print(f"[personnel] companies_to_process={total}")
+    log.info(f"[personnel] output_dir={output_run_dir}")
+    log.info(f"[personnel] cache_dir={cache_dir}")
+    log.info(f"[personnel] cache_ttl_days={ttl_days}")
+    log.info(f"[personnel] companies_to_process={total}")
 
     succeeded = 0
     failed = 0
@@ -494,7 +513,7 @@ def _run_personnel_mode(args: argparse.Namespace, input_xlsx: Path, ch_api_key: 
             officers_path = company_dir / "officers.json"
             write_json(officers_path, officers)
             succeeded += 1
-            print(f"{prefix} success officers={len(officers)} source={source}")
+            log.info(f"{prefix} success officers={len(officers)} source={source}")
         except Exception as exc:
             result = {
                 "company_number": company_number,
@@ -506,7 +525,7 @@ def _run_personnel_mode(args: argparse.Namespace, input_xlsx: Path, ch_api_key: 
                 "error": str(exc),
             }
             failed += 1
-            print(f"{prefix} failed error={exc}")
+            log.error(f"{prefix} failed error={exc}")
         all_results.append(result)
 
     summary_path = output_run_dir / "personnel_summary.json"
@@ -525,8 +544,8 @@ def _run_personnel_mode(args: argparse.Namespace, input_xlsx: Path, ch_api_key: 
         "companies": all_results,
     })
 
-    print(f"[personnel] complete processed={total} succeeded={succeeded} failed={failed} cache_hits={cache_hits}")
-    print(f"[personnel] summary={summary_path}")
+    log.info(f"[personnel] complete processed={total} succeeded={succeeded} failed={failed} cache_hits={cache_hits}")
+    log.info(f"[personnel] summary={summary_path}")
     return 0
 
 
@@ -562,11 +581,10 @@ def main() -> int:
     company_type = CompanyType(args.company_type)
 
     if not args.no_name_enrichment and company_type != CompanyType.ACADEMY_TRUST:
-        print(
-            "WARNING: Name enrichment is enabled but --company-type is not 'academy_trust'.\n"
-            "  The academy_trust prompts extract organisation_type which enrichment uses.\n"
-            "  Consider using --company-type academy_trust or --no-name-enrichment.",
-            flush=True,
+        log.warning(
+            "Name enrichment is enabled but --company-type is not 'academy_trust'. "
+            "The academy_trust prompts extract organisation_type which enrichment uses. "
+            "Consider using --company-type academy_trust or --no-name-enrichment."
         )
 
     output_root = Path(args.output_root)
@@ -588,8 +606,8 @@ def main() -> int:
         model=args.model,
         extraction_types=extraction_types,
     )
-    print(f"[run {run_id}] output_dir={output_run_dir}")
-    print(f"[run {run_id}] db_path={db_path}")
+    log.info(f"[run {run_id}] output_dir={output_run_dir}")
+    log.info(f"[run {run_id}] db_path={db_path}")
 
     rows = read_xlsx_rows(input_xlsx)
     seen: set[str] = set()
@@ -622,25 +640,13 @@ def main() -> int:
         [args.model] + parse_fallback_models(args.fallback_models)
     )
 
-    print(f"[run {run_id}] companies_to_process={total_companies}")
-    print(f"[run {run_id}] models={model_candidates}")
-    print(
-        "[run {}] companies_house_min_request_interval_seconds={}".format(
-            run_id, args.ch_min_request_interval_seconds
-        )
-    )
-    print(
-        "[run {}] filing_history_items_per_page={}".format(
-            run_id, args.filing_history_items_per_page
-        )
-    )
-    print(
-        "[run {}] retries_on_invalid_json={}".format(
-            run_id, args.retries_on_invalid_json
-        )
-    )
-    print("[run {}] schema_profile={}".format(run_id, args.schema_profile))
-    print("[run {}] company_type={}".format(run_id, company_type.value))
+    log.info(f"[run {run_id}] companies_to_process={total_companies}")
+    log.info(f"[run {run_id}] models={model_candidates}")
+    log.info(f"[run {run_id}] ch_min_request_interval_seconds={args.ch_min_request_interval_seconds}")
+    log.info(f"[run {run_id}] filing_history_items_per_page={args.filing_history_items_per_page}")
+    log.info(f"[run {run_id}] retries_on_invalid_json={args.retries_on_invalid_json}")
+    log.info(f"[run {run_id}] schema_profile={args.schema_profile}")
+    log.info(f"[run {run_id}] company_type={company_type.value}")
 
     if args.extraction_workers < 1:
         raise ValueError("extraction-workers must be >= 1")
@@ -652,7 +658,7 @@ def main() -> int:
     )
 
     extraction_workers = args.extraction_workers
-    print(f"[run {run_id}] extraction_workers={extraction_workers}")
+    log.info(f"[run {run_id}] extraction_workers={extraction_workers}")
 
     # Pre-configure DSPy on the main thread so worker threads can use it
     if not args.no_name_enrichment:
@@ -663,12 +669,11 @@ def main() -> int:
             try:
                 configure_dspy(gemini_key)
             except Exception as exc:
-                print(f"[run {run_id}] WARNING: failed to configure name enrichment: {exc}")
+                log.warning(f"[run {run_id}] failed to configure name enrichment: {exc}")
 
     # -- shared mutable state protected by locks --
     counters_lock = threading.Lock()
     db_lock = threading.Lock()
-    print_lock = threading.Lock()
     processed = 0
     succeeded = 0
     failed = 0
@@ -685,8 +690,7 @@ def main() -> int:
         """Run CH API calls + PDF download for one company. Returns result dict."""
         company_number = item["company_number"]
         prefix = f"[run {run_id}] [{seq_num}/{total_companies}] {company_number}"
-        with print_lock:
-            print(f"{prefix} download start")
+        log.info(f"{prefix} download start")
 
         company_dir = output_run_dir / company_number
         api_dir = company_dir / "api"
@@ -710,8 +714,7 @@ def main() -> int:
                     try:
                         cached_profile = json.loads(prev_profile.read_text(encoding="utf-8"))
                         cached_filing_history = json.loads(prev_fh.read_text(encoding="utf-8"))
-                        with print_lock:
-                            print(f"{prefix} using cached profile+filing_history from: {prev_run_dir.name}")
+                        log.debug(f"{prefix} using cached profile+filing_history from: {prev_run_dir.name}")
                         break
                     except (json.JSONDecodeError, OSError):
                         cached_profile = None
@@ -763,8 +766,7 @@ def main() -> int:
                 doc_dir.mkdir(parents=True, exist_ok=True)
                 shutil.copy(existing_pdf, pdf_path)
                 downloaded_path = str(pdf_path)
-                with print_lock:
-                    print(f"{prefix} using cached PDF from: {existing_pdf}")
+                log.debug(f"{prefix} using cached PDF from: {existing_pdf}")
             else:
                 downloaded_path = client.download_document(
                     document_id=document_id,
@@ -781,12 +783,10 @@ def main() -> int:
             result["approx_llm_tokens"] = approx_llm_tokens
             result["api_dir"] = str(api_dir)
             result["ok"] = True
-            with print_lock:
-                print(f"{prefix} download ok document_id={document_id}")
+            log.info(f"{prefix} download ok document_id={document_id}")
         except Exception as exc:
             result["error"] = exc
-            with print_lock:
-                print(f"{prefix} download failed stage={result['stage']} error={exc}")
+            log.error(f"{prefix} download failed stage={result['stage']} error={exc}")
 
         return result
 
@@ -974,10 +974,7 @@ def main() -> int:
                     "error": None,
                 }
             )
-            with print_lock:
-                print(
-                    f"{prefix} success document_id={document_id} model={model_used}"
-                )
+            log.info(f"{prefix} extraction success document_id={document_id} model={model_used}")
         except Exception as exc:
             error_message = "".join(
                 traceback.format_exception(exc.__class__, exc, exc.__traceback__)
@@ -1021,8 +1018,7 @@ def main() -> int:
                     "error": str(exc),
                 }
             )
-            with print_lock:
-                print(f"{prefix} failed error={exc}")
+            log.error(f"{prefix} extraction failed error={exc}")
 
         with counters_lock:
             processed += 1
@@ -1102,11 +1098,9 @@ def main() -> int:
             "companies": company_summaries,
         }
         write_json(summary_path, summary_payload)
-        print(f"[run {run_id}] summary_json_path={summary_path}")
+        log.info(f"[run {run_id}] summary_json_path={summary_path}")
 
-    print(
-        f"[run {run_id}] complete processed={processed} succeeded={succeeded} failed={failed}"
-    )
+    log.info(f"[run {run_id}] complete processed={processed} succeeded={succeeded} failed={failed}")
     return 0
 
 
