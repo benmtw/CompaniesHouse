@@ -32,6 +32,7 @@ def save_results(
     had_schema_depth_error: bool,
     output_run_dir: str,
     db_path: str,
+    cache_hit: bool = False,
 ) -> dict:
     """Write JSON files and insert SQLite row for a successful company."""
     company_dir = Path(output_run_dir) / company_number
@@ -67,6 +68,7 @@ def save_results(
             t.value if hasattr(t, "value") else str(t) for t in extraction_types
         ],
         "schema_profile_fallback_applied": had_schema_depth_error,
+        "extraction_cache_hit": cache_hit,
         "extraction_result": extraction_payload,
     }
 
@@ -112,4 +114,5 @@ def save_results(
         "document_id": document_id,
         "pdf_path": pdf_path,
         "model_used": model_used,
+        "extraction_cache_hit": cache_hit,
     }

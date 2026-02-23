@@ -12,6 +12,7 @@ from openrouter_document_extractor import DocumentExtractionError
 from shared import (
     extract_with_model_fallback,
     extraction_types_for_schema_profile,
+    get_cached_extraction,
     is_schema_depth_error,
     latest_full_accounts_document_id,
 )
@@ -40,15 +41,28 @@ def extract_document(
     openrouter_api_key: str,
     model_candidates: list[str],
     document_path: str,
+    document_id: str,
+    db_path: str,
     extraction_types: list[ExtractionType],
     retries_on_invalid_json: int = 2,
     schema_profile: str = "compact_single_call",
     company_type: CompanyType = CompanyType.GENERIC,
-) -> tuple[dict, list[str], str]:
-    """Run LLM extraction with model fallback + schema fallback.
+) -> tuple[dict, list[str], str, bool]:
+    """Run LLM extraction with caching and model fallback + schema fallback.
 
-    Returns (extraction_payload, warnings, model_used).
+    Returns (extraction_payload, warnings, model_used, cache_hit).
+    Cache hit is True if the result was retrieved from a previous successful extraction.
     """
+    # Check cache first - documents never change, so cached extractions are always valid
+    cached = get_cached_extraction(db_path, document_id)
+    if cached is not None:
+        return (
+            cached["extraction_payload"],
+            cached["warnings"],
+            cached["model_used"],
+            True,  # cache_hit
+        )
+
     rate_limit("openrouter-llm")
     try:
         payload, warnings, model_used = extract_with_model_fallback(
@@ -59,7 +73,7 @@ def extract_document(
             retries_on_invalid_json=retries_on_invalid_json,
             company_type=company_type,
         )
-        return payload, warnings, model_used
+        return payload, warnings, model_used, False  # cache_hit
     except DocumentExtractionError as exc:
         if schema_profile == "compact_single_call" and is_schema_depth_error(exc):
             fallback_types = extraction_types_for_schema_profile(
@@ -73,5 +87,5 @@ def extract_document(
                 retries_on_invalid_json=retries_on_invalid_json,
                 company_type=company_type,
             )
-            return payload, warnings, model_used
+            return payload, warnings, model_used, False  # cache_hit
         raise

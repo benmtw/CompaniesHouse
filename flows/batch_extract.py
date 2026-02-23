@@ -103,10 +103,12 @@ def process_company_flow(
     pdf_size_bytes = Path(downloaded_path).stat().st_size
     approx_llm_tokens = estimate_llm_tokens_for_pdf_bytes(pdf_size_bytes)
 
-    extraction_payload, warnings, model_used = extract_document(
+    extraction_payload, warnings, model_used, cache_hit = extract_document(
         openrouter_api_key=openrouter_api_key,
         model_candidates=model_candidates,
         document_path=downloaded_path,
+        document_id=document_id,
+        db_path=db_path,
         extraction_types=extraction_types,
         retries_on_invalid_json=retries_on_invalid_json,
         schema_profile=schema_profile,
@@ -141,6 +143,7 @@ def process_company_flow(
         had_schema_depth_error=False,
         output_run_dir=output_run_dir,
         db_path=db_path,
+        cache_hit=cache_hit,
     )
     return result
 
@@ -324,7 +327,8 @@ def batch_extract_companies_flow(
                 )
                 print(
                     f"{prefix} success document_id={result.get('document_id')} "
-                    f"model={result.get('model_used')}"
+                    f"model={result.get('model_used')} "
+                    f"extraction_cache={'hit' if result.get('extraction_cache_hit') else 'miss'}"
                 )
             except Exception as exc:
                 failed += 1
