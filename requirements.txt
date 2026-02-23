@@ -2,3 +2,5 @@ requests>=2.31.0
 pydantic>=2.7.0
 json-repair>=0.39.0
 prefect>=3.0,<4.0
+pypdf>=4.0.0
+nameparser>=1.1.0

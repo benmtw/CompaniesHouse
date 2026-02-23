@@ -35,6 +35,35 @@ PROMPT_PROFILES: dict[CompanyType, dict[str, str]] = {
             "For annual report sections, use null or omit optional fields when "
             "the filing does not provide a value."
         ),
+        "personnel_prompt": (
+            "Extract personnel details with fields: first_name, last_name, job_title, "
+            "standardised_job_title.\n"
+            "last_name MUST be the person's actual surname (family name), never an initial. "
+            "If the document shows initials before a surname (e.g. 'S J Bates'), "
+            "first_name should contain all initials/given names ('S J') and last_name "
+            "must be the surname ('Bates').\n"
+            "Exclude anyone whose only role is 'Member' or 'Trustee'.\n"
+            "If a person explicitly resigned from their role during the period, exclude them.\n"
+            "For standardised_job_title, use one of the following values if the person's "
+            "role clearly matches, otherwise use null:\n"
+            "  - Chief Executive Officer\n"
+            "  - Chief Financial Officer / Director of Finance\n"
+            "  - Director of Operations\n"
+            "  - Director of People / HR\n"
+            "  - Director of Education\n"
+            "  - Director of Standards / School Improvement\n"
+            "  - Director of Safeguarding\n"
+            "  - Director of SEND / Inclusion\n"
+            "  - Director of Governance / Company Secretary\n"
+            "  - Director of IT / Digital\n"
+            "  - Director of Estates / Property\n"
+            "  - Director of Data & Assessment\n"
+            "  - Director of Communications / Marketing\n"
+            "  - Director of Procurement\n"
+            "  - Director of Compliance / Risk\n"
+            "It is perfectly acceptable for standardised_job_title to be null when the "
+            "role does not confidently map to one of the above."
+        ),
     },
     CompanyType.ACADEMY_TRUST: {
         "entity_label": "academy trust",
@@ -57,6 +86,37 @@ PROMPT_PROFILES: dict[CompanyType, dict[str, str]] = {
         "optional_fields_hint": (
             "For academy trust report sections, use null or omit optional fields when "
             "the filing does not provide a value."
+        ),
+        "personnel_prompt": (
+            "Extract personnel details with fields: first_name, last_name, job_title, "
+            "organisation_name, organisation_type, standardised_job_title.\n"
+            "last_name MUST be the person's actual surname (family name), never an initial. "
+            "If the document shows initials before a surname (e.g. 'S J Bates'), "
+            "first_name should contain all initials/given names ('S J') and last_name "
+            "must be the surname ('Bates').\n"
+            "organisation_name is the name of the trust or school the person works at.\n"
+            "organisation_type must be either 'trust' or 'school', or null if unclear.\n"
+            "Exclude anyone whose only role is 'Member' or 'Trustee'.\n"
+            "If a person explicitly resigned from their role during the period, exclude them.\n"
+            "For standardised_job_title, use one of the following values if the person's "
+            "role clearly matches, otherwise use null:\n"
+            "  - Chief Executive Officer\n"
+            "  - Chief Financial Officer / Director of Finance\n"
+            "  - Director of Operations\n"
+            "  - Director of People / HR\n"
+            "  - Director of Education\n"
+            "  - Director of Standards / School Improvement\n"
+            "  - Director of Safeguarding\n"
+            "  - Director of SEND / Inclusion\n"
+            "  - Director of Governance / Company Secretary\n"
+            "  - Director of IT / Digital\n"
+            "  - Director of Estates / Property\n"
+            "  - Director of Data & Assessment\n"
+            "  - Director of Communications / Marketing\n"
+            "  - Director of Procurement\n"
+            "  - Director of Compliance / Risk\n"
+            "It is perfectly acceptable for standardised_job_title to be null when the "
+            "role does not confidently map to one of the above."
         ),
     },
 }

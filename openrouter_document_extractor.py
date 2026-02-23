@@ -140,9 +140,7 @@ class OpenRouterDocumentExtractor:
         profile = get_prompt_profile(company_type)
         task_lines: list[str] = []
         if ExtractionType.PersonnelDetails in requested_types:
-            task_lines.append(
-                "- Extract personnel details with fields: first_name, last_name, job_title."
-            )
+            task_lines.append(f"- {profile['personnel_prompt']}")
         if ExtractionType.BalanceSheet in requested_types:
             task_lines.append("- Extract balance sheet values as line items.")
         if ExtractionType.Metadata in requested_types:
@@ -180,7 +178,9 @@ class OpenRouterDocumentExtractor:
             + "\n".join(task_lines)
             + "\n"
             "Do not emit a personnel row unless first_name, last_name, and job_title "
-            "are all present and non-empty.\n"
+            "are all present and non-empty. "
+            "last_name must be the actual surname, not an initial.\n"
+            "Exclude any person who explicitly resigned from their role during the period.\n"
             "Do not emit a balance_sheet row unless line_item and value are both "
             "present and non-empty.\n"
             "For optional fields like period and currency, use null when the value "
@@ -243,24 +243,38 @@ class OpenRouterDocumentExtractor:
         required: list[str] = []
 
         if ExtractionType.PersonnelDetails in requested_types:
+            personnel_props: dict[str, Any] = {
+                "first_name": {
+                    "type": "string",
+                    "description": "Person's first name.",
+                },
+                "last_name": {
+                    "type": "string",
+                    "description": "Person's last name.",
+                },
+                "job_title": {
+                    "type": "string",
+                    "description": "Role or title at the company.",
+                },
+                "standardised_job_title": {
+                    "type": ["string", "null"],
+                    "description": "One of the 15 recognised standardised titles, or null.",
+                },
+            }
+            if company_type == CompanyType.ACADEMY_TRUST:
+                personnel_props["organisation_name"] = {
+                    "type": ["string", "null"],
+                    "description": "Name of the trust or school.",
+                }
+                personnel_props["organisation_type"] = {
+                    "type": ["string", "null"],
+                    "description": "Either 'trust' or 'school', or null.",
+                }
             properties["personnel_details"] = {
                 "type": "array",
                 "items": {
                     "type": "object",
-                    "properties": {
-                        "first_name": {
-                            "type": "string",
-                            "description": "Person's first name.",
-                        },
-                        "last_name": {
-                            "type": "string",
-                            "description": "Person's last name.",
-                        },
-                        "job_title": {
-                            "type": "string",
-                            "description": "Role or title at the company.",
-                        },
-                    },
+                    "properties": personnel_props,
                     "required": ["first_name", "last_name", "job_title"],
                     "additionalProperties": False,
                 },
@@ -975,6 +989,10 @@ class OpenRouterDocumentExtractor:
             ]
         return []
 
+    _MEMBER_TRUSTEE_ONLY = re.compile(
+        r"^(member|trustee|member\s*/\s*trustee|trustee\s*/\s*member)$", re.IGNORECASE
+    )
+
     @staticmethod
     def _parse_personnel_details(raw_personnel: Any) -> list[PersonnelDetail]:
         if not isinstance(raw_personnel, list):
@@ -982,11 +1000,14 @@ class OpenRouterDocumentExtractor:
         personnel: list[PersonnelDetail] = []
         for index, row in enumerate(raw_personnel):
             try:
-                personnel.append(PersonnelDetail.model_validate(row))
+                detail = PersonnelDetail.model_validate(row)
             except ValidationError as exc:
                 raise DocumentExtractionError(
                     f"Invalid personnel_details row at index {index}: {exc}"
                 ) from exc
+            if OpenRouterDocumentExtractor._MEMBER_TRUSTEE_ONLY.match(detail.job_title.strip()):
+                continue
+            personnel.append(detail)
         return personnel
 
     @staticmethod

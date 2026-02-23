@@ -5,37 +5,109 @@ Combines personnel data from two sources:
 2. Companies House API - Cached JSON files with full names
 
 Merges the specificity of report job titles with the full names from the API,
-and adds role flags (isCEO, isCFO, isCOO).
+and classifies each person into a standardised role title.
 """
 
 import argparse
 import json
 import os
+import re
 import sqlite3
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
+from nameparser import HumanName
+
+
+# ── Standardised Job Titles ──────────────────────────────────────────────────────
+
+STANDARDISED_TITLES: list[str] = [
+    "Chief Executive Officer",
+    "Chief Financial Officer / Director of Finance",
+    "Director of Operations",
+    "Director of People / HR",
+    "Director of Education",
+    "Director of Standards / School Improvement",
+    "Director of Safeguarding",
+    "Director of SEND / Inclusion",
+    "Director of Governance / Company Secretary",
+    "Director of IT / Digital",
+    "Director of Estates / Property",
+    "Director of Data & Assessment",
+    "Director of Communications / Marketing",
+    "Director of Procurement",
+    "Director of Compliance / Risk",
+]
+
 
 # ── Role Detection Patterns ─────────────────────────────────────────────────────
+# Maps each standardised title to a list of lowercase patterns to match against
+# the raw job_title string.
 
-CEO_PATTERNS = ["chief executive", "ceo", "chief exec", "managing director"]
-CFO_PATTERNS = [
-    "chief finance",
-    "cfo",
-    "finance director",
-    "financial director",
-    "director of finance",
-    "chief financial",
-    "finance and operations officer",
-]
-COO_PATTERNS = [
-    "chief operating",
-    "coo",
-    "chief operations",
-    "operations director",
-    "director of operations",
-]
+ROLE_PATTERNS: dict[str, list[str]] = {
+    "Chief Executive Officer": [
+        "chief executive", "ceo", "chief exec", "managing director",
+    ],
+    "Chief Financial Officer / Director of Finance": [
+        "chief finance", "cfo", "finance director", "financial director",
+        "director of finance", "chief financial", "finance and operations officer",
+    ],
+    "Director of Operations": [
+        "chief operating", "coo", "chief operations", "operations director",
+        "director of operations",
+    ],
+    "Director of People / HR": [
+        "director of people", "director of hr", "director of human resources",
+        "hr director", "head of people", "head of hr", "chief people officer",
+    ],
+    "Director of Education": [
+        "director of education", "chief education officer",
+        "head of education", "education director",
+    ],
+    "Director of Standards / School Improvement": [
+        "director of standards", "director of school improvement",
+        "head of school improvement", "school improvement director",
+    ],
+    "Director of Safeguarding": [
+        "director of safeguarding", "head of safeguarding",
+        "safeguarding director", "safeguarding lead",
+    ],
+    "Director of SEND / Inclusion": [
+        "director of send", "director of inclusion", "head of send",
+        "head of inclusion", "send director", "inclusion director",
+    ],
+    "Director of Governance / Company Secretary": [
+        "director of governance", "company secretary", "governance director",
+        "head of governance", "clerk to the board",
+    ],
+    "Director of IT / Digital": [
+        "director of it", "director of digital", "chief information officer",
+        "cio", "chief technology officer", "cto", "head of it",
+        "head of digital", "it director", "digital director",
+    ],
+    "Director of Estates / Property": [
+        "director of estates", "director of property", "estates director",
+        "head of estates", "property director", "head of property",
+    ],
+    "Director of Data & Assessment": [
+        "director of data", "director of assessment", "head of data",
+        "head of assessment", "data director",
+    ],
+    "Director of Communications / Marketing": [
+        "director of communications", "director of marketing",
+        "communications director", "marketing director",
+        "head of communications", "head of marketing",
+    ],
+    "Director of Procurement": [
+        "director of procurement", "procurement director",
+        "head of procurement", "chief procurement officer",
+    ],
+    "Director of Compliance / Risk": [
+        "director of compliance", "director of risk", "compliance director",
+        "risk director", "head of compliance", "head of risk",
+    ],
+}
 
 
 # ── Small utilities ────────────────────────────────────────────────────────────
@@ -79,28 +151,49 @@ def normalize_company_number(raw_value: str) -> str | None:
 # ── Role Detection ─────────────────────────────────────────────────────────────
 
 
-def is_ceo(job_title: str) -> bool:
-    """Check if a job title indicates a CEO role."""
+def match_standardised_title(job_title: str) -> str | None:
+    """Match a raw job title to one of the standardised titles using pattern matching.
+
+    Uses word-boundary matching so abbreviations like 'cto' don't match
+    inside unrelated words like 'director'.
+
+    Returns the standardised title string or None if no match is found.
+    """
     if not job_title:
-        return False
+        return None
     title_lower = job_title.lower()
-    return any(pattern in title_lower for pattern in CEO_PATTERNS)
+    for std_title, patterns in ROLE_PATTERNS.items():
+        for pattern in patterns:
+            if re.search(r"\b" + re.escape(pattern) + r"\b", title_lower):
+                return std_title
+    return None
 
 
-def is_cfo(job_title: str) -> bool:
-    """Check if a job title indicates a CFO role."""
-    if not job_title:
-        return False
-    title_lower = job_title.lower()
-    return any(pattern in title_lower for pattern in CFO_PATTERNS)
+def resolve_standardised_title(
+    llm_title: str | None, job_title: str
+) -> str | None:
+    """Return the standardised title: prefer LLM value, fall back to local matching."""
+    if llm_title and llm_title in STANDARDISED_TITLES:
+        return llm_title
+    return match_standardised_title(job_title)
 
 
-def is_coo(job_title: str) -> bool:
-    """Check if a job title indicates a COO role."""
-    if not job_title:
-        return False
-    title_lower = job_title.lower()
-    return any(pattern in title_lower for pattern in COO_PATTERNS)
+# ── Name Parsing ──────────────────────────────────────────────────────────────
+
+
+def _parse_name(first_name: str, middle_names: str, last_name: str) -> dict[str, str]:
+    """Parse name fields with nameparser and return a dict of parsed components."""
+    parts = [p for p in (first_name, middle_names, last_name) if p]
+    full_name = " ".join(parts)
+    hn = HumanName(full_name)
+    return {
+        "title": str(hn.title),
+        "first": str(hn.first),
+        "middle": str(hn.middle),
+        "last": str(hn.last),
+        "suffix": str(hn.suffix),
+        "nickname": str(hn.nickname),
+    }
 
 
 # ── Name Matching ──────────────────────────────────────────────────────────────
@@ -261,21 +354,88 @@ def merge_personnel_record(report_person: dict[str, Any], api_officer: dict[str,
     Uses report's job_title (more specific) and API's full name fields.
     """
     job_title = report_person.get("job_title", "")
+    llm_std = report_person.get("standardised_job_title")
+    std_title = resolve_standardised_title(llm_std, job_title)
 
-    return {
+    record: dict[str, Any] = {
         "first_name": api_officer.get("first_name", ""),
         "middle_names": api_officer.get("middle_names", ""),
         "last_name": api_officer.get("last_name", ""),
         "job_title": job_title,
+        "standardised_job_title": std_title,
         "role": api_officer.get("role", ""),
         "appointed_on": api_officer.get("appointed_on", ""),
         "date_of_birth": api_officer.get("date_of_birth"),
         "correspondence_address": api_officer.get("correspondence_address"),
-        "isCEO": is_ceo(job_title),
-        "isCFO": is_cfo(job_title),
-        "isCOO": is_coo(job_title),
         "source": "merged",
     }
+    record["parsed"] = _parse_name(
+        record["first_name"], record["middle_names"], record["last_name"],
+    )
+    if report_person.get("organisation_name") is not None:
+        record["organisation_name"] = report_person["organisation_name"]
+    if report_person.get("organisation_type") is not None:
+        record["organisation_type"] = report_person["organisation_type"]
+    return record
+
+
+def _build_report_only_record(person: dict[str, Any]) -> dict[str, Any]:
+    """Build a personnel record from report-only data."""
+    job_title = person.get("job_title", "")
+    llm_std = person.get("standardised_job_title")
+    std_title = resolve_standardised_title(llm_std, job_title)
+    record: dict[str, Any] = {
+        "first_name": person.get("first_name", ""),
+        "middle_names": "",
+        "last_name": person.get("last_name", ""),
+        "job_title": job_title,
+        "standardised_job_title": std_title,
+        "role": "",
+        "appointed_on": "",
+        "date_of_birth": None,
+        "correspondence_address": None,
+        "source": "report_only",
+    }
+    record["parsed"] = _parse_name(
+        record["first_name"], record["middle_names"], record["last_name"],
+    )
+    if person.get("organisation_name") is not None:
+        record["organisation_name"] = person["organisation_name"]
+    if person.get("organisation_type") is not None:
+        record["organisation_type"] = person["organisation_type"]
+    return record
+
+
+def _build_api_only_record(officer: dict[str, Any]) -> dict[str, Any]:
+    """Build a personnel record from API-only data."""
+    job_title = officer.get("role", "")
+    std_title = match_standardised_title(job_title)
+    record: dict[str, Any] = {
+        "first_name": officer.get("first_name", ""),
+        "middle_names": officer.get("middle_names", ""),
+        "last_name": officer.get("last_name", ""),
+        "job_title": job_title,
+        "standardised_job_title": std_title,
+        "role": officer.get("role", ""),
+        "appointed_on": officer.get("appointed_on", ""),
+        "date_of_birth": officer.get("date_of_birth"),
+        "correspondence_address": officer.get("correspondence_address"),
+        "source": "api_only",
+    }
+    record["parsed"] = _parse_name(
+        record["first_name"], record["middle_names"], record["last_name"],
+    )
+    return record
+
+
+def _count_by_standardised_title(personnel: list[dict[str, Any]]) -> dict[str, int]:
+    """Count personnel by standardised_job_title, only including titles with count > 0."""
+    counts: dict[str, int] = {}
+    for person in personnel:
+        std = person.get("standardised_job_title")
+        if std:
+            counts[std] = counts.get(std, 0) + 1
+    return counts
 
 
 def build_output(
@@ -301,128 +461,33 @@ def build_output(
     matched_count = 0
     unmatched_report_count = 0
     unmatched_api_count = 0
-    ceo_count = 0
-    cfo_count = 0
-    coo_count = 0
 
     if api_officers and report_personnel:
-        # Both sources available - merge
         matched, unmatched_report, unmatched_api = match_personnel(report_personnel, api_officers)
 
         for report_person, api_officer in matched:
             merged = merge_personnel_record(report_person, api_officer)
             personnel.append(merged)
             matched_count += 1
-            if merged["isCEO"]:
-                ceo_count += 1
-            if merged["isCFO"]:
-                cfo_count += 1
-            if merged["isCOO"]:
-                coo_count += 1
 
         if include_unmatched:
             for report_person in unmatched_report:
-                job_title = report_person.get("job_title", "")
-                record = {
-                    "first_name": report_person.get("first_name", ""),
-                    "middle_names": "",
-                    "last_name": report_person.get("last_name", ""),
-                    "job_title": job_title,
-                    "role": "",
-                    "appointed_on": "",
-                    "date_of_birth": None,
-                    "correspondence_address": None,
-                    "isCEO": is_ceo(job_title),
-                    "isCFO": is_cfo(job_title),
-                    "isCOO": is_coo(job_title),
-                    "source": "report_only",
-                }
-                personnel.append(record)
-                if record["isCEO"]:
-                    ceo_count += 1
-                if record["isCFO"]:
-                    cfo_count += 1
-                if record["isCOO"]:
-                    coo_count += 1
-
+                personnel.append(_build_report_only_record(report_person))
             for api_officer in unmatched_api:
-                job_title = api_officer.get("role", "")  # API uses 'role' as generic title
-                record = {
-                    "first_name": api_officer.get("first_name", ""),
-                    "middle_names": api_officer.get("middle_names", ""),
-                    "last_name": api_officer.get("last_name", ""),
-                    "job_title": job_title,
-                    "role": api_officer.get("role", ""),
-                    "appointed_on": api_officer.get("appointed_on", ""),
-                    "date_of_birth": api_officer.get("date_of_birth"),
-                    "correspondence_address": api_officer.get("correspondence_address"),
-                    "isCEO": is_ceo(job_title),
-                    "isCFO": is_cfo(job_title),
-                    "isCOO": is_coo(job_title),
-                    "source": "api_only",
-                }
-                personnel.append(record)
-                if record["isCEO"]:
-                    ceo_count += 1
-                if record["isCFO"]:
-                    cfo_count += 1
-                if record["isCOO"]:
-                    coo_count += 1
+                personnel.append(_build_api_only_record(api_officer))
 
         unmatched_report_count = len(unmatched_report)
         unmatched_api_count = len(unmatched_api)
 
     elif report_personnel:
-        # Only report data available
         for person in report_personnel:
-            job_title = person.get("job_title", "")
-            record = {
-                "first_name": person.get("first_name", ""),
-                "middle_names": "",
-                "last_name": person.get("last_name", ""),
-                "job_title": job_title,
-                "role": "",
-                "appointed_on": "",
-                "date_of_birth": None,
-                "correspondence_address": None,
-                "isCEO": is_ceo(job_title),
-                "isCFO": is_cfo(job_title),
-                "isCOO": is_coo(job_title),
-                "source": "report_only",
-            }
-            personnel.append(record)
-            if record["isCEO"]:
-                ceo_count += 1
-            if record["isCFO"]:
-                cfo_count += 1
-            if record["isCOO"]:
-                coo_count += 1
+            personnel.append(_build_report_only_record(person))
 
     elif api_officers:
-        # Only API data available
         for officer in api_officers:
-            job_title = officer.get("role", "")
-            record = {
-                "first_name": officer.get("first_name", ""),
-                "middle_names": officer.get("middle_names", ""),
-                "last_name": officer.get("last_name", ""),
-                "job_title": job_title,
-                "role": officer.get("role", ""),
-                "appointed_on": officer.get("appointed_on", ""),
-                "date_of_birth": officer.get("date_of_birth"),
-                "correspondence_address": officer.get("correspondence_address"),
-                "isCEO": is_ceo(job_title),
-                "isCFO": is_cfo(job_title),
-                "isCOO": is_coo(job_title),
-                "source": "api_only",
-            }
-            personnel.append(record)
-            if record["isCEO"]:
-                ceo_count += 1
-            if record["isCFO"]:
-                cfo_count += 1
-            if record["isCOO"]:
-                coo_count += 1
+            personnel.append(_build_api_only_record(officer))
+
+    title_counts = _count_by_standardised_title(personnel)
 
     return {
         "company_number": company_number,
@@ -434,9 +499,7 @@ def build_output(
             "matched": matched_count,
             "unmatched_report": unmatched_report_count,
             "unmatched_api": unmatched_api_count,
-            "ceos": ceo_count,
-            "cfos": cfo_count,
-            "coos": coo_count,
+            "by_standardised_title": title_counts,
         },
     }
 
@@ -470,39 +533,48 @@ def format_pretty(result: dict[str, Any]) -> str:
     lines.append(f"  Matched: {summary.get('matched', 0)}")
     lines.append(f"  Unmatched from Report: {summary.get('unmatched_report', 0)}")
     lines.append(f"  Unmatched from API: {summary.get('unmatched_api', 0)}")
-    lines.append(f"  CEOs: {summary.get('ceos', 0)}")
-    lines.append(f"  CFOs: {summary.get('cfos', 0)}")
-    lines.append(f"  COOs: {summary.get('coos', 0)}")
+    title_counts = summary.get("by_standardised_title", {})
+    if title_counts:
+        lines.append("  By Standardised Title:")
+        for title, count in sorted(title_counts.items()):
+            lines.append(f"    {title}: {count}")
     lines.append("")
 
     personnel = result.get("personnel", [])
     if personnel:
         lines.append("Personnel:")
         for person in personnel:
-            name_parts = []
-            if person.get("first_name"):
-                name_parts.append(person["first_name"])
-            if person.get("middle_names"):
-                name_parts.append(person["middle_names"])
-            if person.get("last_name"):
-                name_parts.append(person["last_name"])
-            full_name = " ".join(name_parts) or "Unknown"
+            first = person.get("first_name", "")
+            last = person.get("last_name", "")
+            display_name = f"{first} {last}".strip() or "Unknown"
 
             job_title = person.get("job_title", "No title")
             role = person.get("role", "")
             source = person.get("source", "")
+            std_title = person.get("standardised_job_title")
+            middle = person.get("middle_names", "")
 
-            flags = []
-            if person.get("isCEO"):
-                flags.append("CEO")
-            if person.get("isCFO"):
-                flags.append("CFO")
-            if person.get("isCOO"):
-                flags.append("COO")
-            flag_str = f" [{', '.join(flags)}]" if flags else ""
+            std_str = f" [{std_title}]" if std_title else ""
 
-            lines.append(f"  - {full_name}")
-            lines.append(f"    Title: {job_title}{flag_str}")
+            parsed = person.get("parsed", {})
+            parsed_title = parsed.get("title", "")
+            parsed_suffix = parsed.get("suffix", "")
+            parsed_nickname = parsed.get("nickname", "")
+
+            lines.append(f"  - {display_name}")
+            if parsed_title:
+                lines.append(f"    Honorific: {parsed_title}")
+            if middle:
+                lines.append(f"    Middle Names: {middle}")
+            if parsed_suffix:
+                lines.append(f"    Suffix: {parsed_suffix}")
+            if parsed_nickname:
+                lines.append(f"    Nickname: {parsed_nickname}")
+            lines.append(f"    Title: {job_title}{std_str}")
+            if person.get("organisation_name"):
+                org_type = person.get("organisation_type", "")
+                org_suffix = f" ({org_type})" if org_type else ""
+                lines.append(f"    Organisation: {person['organisation_name']}{org_suffix}")
             if role:
                 lines.append(f"    Role: {role}")
             if person.get("appointed_on"):
