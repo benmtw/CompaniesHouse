@@ -1,11 +1,15 @@
 import argparse
 import json
 import os
+import queue
 import random
+import shutil
 import sqlite3
+import threading
 import time
 import traceback
 import xml.etree.ElementTree as ET
+from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -349,6 +353,12 @@ def build_parser() -> argparse.ArgumentParser:
         help="Days before a cached personnel lookup is considered stale (default: %(default)s, 0 to disable cache)",
     )
     parser.add_argument(
+        "--extraction-workers",
+        type=int,
+        default=5,
+        help="Number of concurrent LLM extraction threads (default: 5)",
+    )
+    parser.add_argument(
         "--use-prefect",
         action="store_true",
         help="Run as a Prefect flow instead of the legacy sequential script",
@@ -552,7 +562,7 @@ def main() -> int:
 
     db_path = Path(args.db_path) if args.db_path else output_root / DEFAULT_DB_NAME
     ensure_parent(db_path)
-    conn = sqlite3.connect(db_path)
+    conn = sqlite3.connect(db_path, check_same_thread=False)
     create_tables(conn)
 
     extraction_types = extraction_types_for_schema_profile(args.schema_profile, company_type)
@@ -618,30 +628,160 @@ def main() -> int:
     print("[run {}] schema_profile={}".format(run_id, args.schema_profile))
     print("[run {}] company_type={}".format(run_id, company_type.value))
 
+    if args.extraction_workers < 1:
+        raise ValueError("extraction-workers must be >= 1")
+
     client = CompaniesHouseClient(api_key=ch_api_key)
     throttle_state = _install_companies_house_request_throttle(
         client=client,
         min_interval_seconds=args.ch_min_request_interval_seconds,
     )
 
+    extraction_workers = args.extraction_workers
+    print(f"[run {run_id}] extraction_workers={extraction_workers}")
+
+    # -- shared mutable state protected by locks --
+    counters_lock = threading.Lock()
+    db_lock = threading.Lock()
+    print_lock = threading.Lock()
     processed = 0
     succeeded = 0
     failed = 0
     company_summaries: list[dict[str, Any]] = []
 
-    for item in batch:
-        processed += 1
+    download_queue: queue.Queue[tuple[int, dict[str, Any], dict[str, Any]] | None] = (
+        queue.Queue(maxsize=extraction_workers * 2)
+    )
+
+    def _download_company(
+        item: dict[str, Any],
+        seq_num: int,
+    ) -> dict[str, Any]:
+        """Run CH API calls + PDF download for one company. Returns result dict."""
         company_number = item["company_number"]
-        prefix = f"[run {run_id}] [{processed}/{total_companies}] {company_number}"
-        print(f"{prefix} start")
+        prefix = f"[run {run_id}] [{seq_num}/{total_companies}] {company_number}"
+        with print_lock:
+            print(f"{prefix} download start")
+
         company_dir = output_run_dir / company_number
         api_dir = company_dir / "api"
         doc_dir = company_dir / "documents"
-        extraction_dir = company_dir / "extraction"
         api_dir.mkdir(parents=True, exist_ok=True)
         doc_dir.mkdir(parents=True, exist_ok=True)
+
+        result: dict[str, Any] = {"stage": "start", "ok": False}
+
+        try:
+            # Check previous runs for cached profile and filing history
+            cached_profile = None
+            cached_filing_history = None
+            for prev_run_dir in sorted(Path(output_root).glob("run_*"), reverse=True):
+                if prev_run_dir == output_run_dir:
+                    continue
+                prev_api_dir = prev_run_dir / company_number / "api"
+                prev_profile = prev_api_dir / "profile.json"
+                prev_fh = prev_api_dir / "filing_history.json"
+                if prev_profile.exists() and prev_fh.exists():
+                    try:
+                        cached_profile = json.loads(prev_profile.read_text(encoding="utf-8"))
+                        cached_filing_history = json.loads(prev_fh.read_text(encoding="utf-8"))
+                        with print_lock:
+                            print(f"{prefix} using cached profile+filing_history from: {prev_run_dir.name}")
+                        break
+                    except (json.JSONDecodeError, OSError):
+                        cached_profile = None
+                        cached_filing_history = None
+
+            if cached_profile is not None:
+                profile = cached_profile
+            else:
+                profile = client.get_company_profile(company_number)
+            result["profile"] = profile
+            result["stage"] = "profile_ok"
+
+            if cached_filing_history is not None:
+                filing_history = cached_filing_history
+            else:
+                filing_history_page = client.get_filing_history(
+                    company_number=company_number,
+                    items_per_page=args.filing_history_items_per_page,
+                    start_index=0,
+                )
+                filing_history = filing_history_page.get("items") or []
+            result["filing_history"] = filing_history
+            result["stage"] = "filing_history_ok"
+
+            document_id = latest_full_accounts_document_id(filing_history)
+            if not document_id:
+                raise ValueError("No full accounts document found")
+            result["document_id"] = document_id
+            result["stage"] = "latest_document_ok"
+
+            pdf_path = doc_dir / f"{company_number}_latest_full_accounts_{document_id}.pdf"
+
+            # Check for existing PDF in any previous run for this document_id
+            existing_pdf = None
+            for prev_run_dir in sorted(Path(output_root).glob("run_*"), reverse=True):
+                if prev_run_dir == output_run_dir:
+                    continue
+                candidate = (
+                    prev_run_dir
+                    / company_number
+                    / "documents"
+                    / f"{company_number}_latest_full_accounts_{document_id}.pdf"
+                )
+                if candidate.exists():
+                    existing_pdf = candidate
+                    break
+
+            if existing_pdf:
+                doc_dir.mkdir(parents=True, exist_ok=True)
+                shutil.copy(existing_pdf, pdf_path)
+                downloaded_path = str(pdf_path)
+                with print_lock:
+                    print(f"{prefix} using cached PDF from: {existing_pdf}")
+            else:
+                downloaded_path = client.download_document(
+                    document_id=document_id,
+                    output_path=str(pdf_path),
+                    accept="application/pdf",
+                )
+
+            result["stage"] = "download_ok"
+            pdf_size_bytes = Path(downloaded_path).stat().st_size
+            approx_llm_tokens = estimate_llm_tokens_for_pdf_bytes(pdf_size_bytes)
+            result["pdf_path"] = str(pdf_path)
+            result["downloaded_path"] = downloaded_path
+            result["pdf_size_bytes"] = pdf_size_bytes
+            result["approx_llm_tokens"] = approx_llm_tokens
+            result["api_dir"] = str(api_dir)
+            result["ok"] = True
+            with print_lock:
+                print(f"{prefix} download ok document_id={document_id}")
+        except Exception as exc:
+            result["error"] = exc
+            with print_lock:
+                print(f"{prefix} download failed stage={result['stage']} error={exc}")
+
+        return result
+
+    def _extract_company(
+        item: dict[str, Any],
+        seq_num: int,
+        dl: dict[str, Any],
+    ) -> None:
+        """Run LLM extraction + persistence for one company."""
+        nonlocal processed, succeeded, failed
+
+        company_number = item["company_number"]
+        prefix = f"[run {run_id}] [{seq_num}/{total_companies}] {company_number}"
+
+        company_dir = output_run_dir / company_number
+        api_dir = company_dir / "api"
+        extraction_dir = company_dir / "extraction"
         extraction_dir.mkdir(parents=True, exist_ok=True)
-        stage = "start"
+
+        stage = dl["stage"]
         summary_row: dict[str, Any] = {
             "source_row_index": item["source_row_index"],
             "group_uid": item.get("group_uid"),
@@ -650,71 +790,40 @@ def main() -> int:
             "company_number": company_number,
             "status": "failed",
             "companies_house_stage": stage,
-            "document_id": None,
-            "pdf_path": None,
-            "pdf_size_bytes": None,
-            "approx_llm_tokens": None,
+            "document_id": dl.get("document_id"),
+            "pdf_path": dl.get("pdf_path"),
+            "pdf_size_bytes": dl.get("pdf_size_bytes"),
+            "approx_llm_tokens": dl.get("approx_llm_tokens"),
             "model_used": None,
             "error": None,
         }
 
         try:
-            profile = client.get_company_profile(company_number)
-            stage = "profile_ok"
-            filing_history_page = client.get_filing_history(
-                company_number=company_number,
-                items_per_page=args.filing_history_items_per_page,
-                start_index=0,
-            )
-            filing_history = filing_history_page.get("items") or []
-            stage = "filing_history_ok"
-            document_id = latest_full_accounts_document_id(filing_history)
-            if not document_id:
-                raise ValueError("No full accounts document found")
-            stage = "latest_document_ok"
-            summary_row["document_id"] = document_id
+            if not dl["ok"]:
+                raise dl["error"]
 
-            pdf_path = doc_dir / f"{company_number}_latest_full_accounts_{document_id}.pdf"
-
-            # Check for existing PDF in any previous run for this document_id
-            existing_pdf = None
-            for run_dir in sorted(Path(output_root).glob("run_*"), reverse=True):
-                candidate = run_dir / company_number / "documents" / f"{company_number}_latest_full_accounts_{document_id}.pdf"
-                if candidate.exists():
-                    existing_pdf = candidate
-                    break
-
-            if existing_pdf:
-                import shutil
-                doc_dir.mkdir(parents=True, exist_ok=True)
-                shutil.copy(existing_pdf, pdf_path)
-                downloaded_path = str(pdf_path)
-                print(f"{prefix} using cached PDF from: {existing_pdf}")
-            else:
-                downloaded_path = client.download_document(
-                    document_id=document_id,
-                    output_path=str(pdf_path),
-                    accept="application/pdf",
-                )
-            stage = "download_ok"
-            pdf_size_bytes = Path(downloaded_path).stat().st_size
-            approx_llm_tokens = estimate_llm_tokens_for_pdf_bytes(pdf_size_bytes)
-            summary_row["pdf_path"] = str(pdf_path)
-            summary_row["pdf_size_bytes"] = pdf_size_bytes
-            summary_row["approx_llm_tokens"] = approx_llm_tokens
+            downloaded_path = dl["downloaded_path"]
+            document_id = dl["document_id"]
+            profile = dl["profile"]
+            filing_history = dl["filing_history"]
+            pdf_path = dl["pdf_path"]
+            pdf_size_bytes = dl["pdf_size_bytes"]
+            approx_llm_tokens = dl["approx_llm_tokens"]
 
             extraction_schema_profile = args.schema_profile
             had_schema_depth_error = False
             run_extraction_types = extraction_types
 
             try:
-                extraction_payload, warnings_payload, model_used = extract_with_model_fallback(
-                    api_key=openrouter_api_key,
-                    model_candidates=model_candidates,
-                    document_path=downloaded_path,
-                    extraction_types=run_extraction_types,
-                    retries_on_invalid_json=args.retries_on_invalid_json,
-                    company_type=company_type,
+                extraction_payload, warnings_payload, model_used = (
+                    extract_with_model_fallback(
+                        api_key=openrouter_api_key,
+                        model_candidates=model_candidates,
+                        document_path=downloaded_path,
+                        extraction_types=run_extraction_types,
+                        retries_on_invalid_json=args.retries_on_invalid_json,
+                        company_type=company_type,
+                    )
                 )
             except DocumentExtractionError as exc:
                 if (
@@ -726,13 +835,15 @@ def main() -> int:
                     run_extraction_types = extraction_types_for_schema_profile(
                         extraction_schema_profile, company_type
                     )
-                    extraction_payload, warnings_payload, model_used = extract_with_model_fallback(
-                        api_key=openrouter_api_key,
-                        model_candidates=model_candidates,
-                        document_path=downloaded_path,
-                        extraction_types=run_extraction_types,
-                        retries_on_invalid_json=args.retries_on_invalid_json,
-                        company_type=company_type,
+                    extraction_payload, warnings_payload, model_used = (
+                        extract_with_model_fallback(
+                            api_key=openrouter_api_key,
+                            model_candidates=model_candidates,
+                            document_path=downloaded_path,
+                            extraction_types=run_extraction_types,
+                            retries_on_invalid_json=args.retries_on_invalid_json,
+                            company_type=company_type,
+                        )
                     )
                 else:
                     raise
@@ -743,7 +854,9 @@ def main() -> int:
                 else "annual_report"
             )
             if extraction_payload.get(annual_report_key) is None:
-                derived = derive_annual_report_from_component_sections(extraction_payload)
+                derived = derive_annual_report_from_component_sections(
+                    extraction_payload
+                )
                 if derived is not None:
                     extraction_payload[annual_report_key] = derived
             stage = "extraction_ok"
@@ -763,7 +876,7 @@ def main() -> int:
                 "company_number": company_number,
                 "company_name": profile.get("company_name"),
                 "document_id": document_id,
-                "pdf_path": str(pdf_path),
+                "pdf_path": pdf_path,
                 "pdf_size_bytes": pdf_size_bytes,
                 "approx_llm_tokens": approx_llm_tokens,
                 "model": args.model,
@@ -780,41 +893,45 @@ def main() -> int:
             write_json(warnings_path, warnings_payload)
             write_json(run_report_path, run_report)
 
-            insert_company_row(
-                conn,
-                {
-                    "run_id": run_id,
-                    "source_row_index": item["source_row_index"],
-                    "group_uid": item.get("group_uid"),
-                    "group_id": item.get("group_id"),
-                    "group_name": item.get("group_name"),
-                    "company_number": company_number,
-                    "company_name": profile.get("company_name"),
-                    "status": "success",
-                    "document_id": document_id,
-                    "pdf_path": str(pdf_path),
-                    "profile_json_path": str(profile_path),
-                    "filing_history_json_path": str(filing_history_path),
-                    "extraction_json_path": str(extraction_path),
-                    "warnings_json_path": str(warnings_path),
-                    "profile_json": json.dumps(profile),
-                    "filing_history_json": json.dumps(filing_history),
-                    "extraction_json": json.dumps(extraction_payload),
-                    "warnings_json": json.dumps(warnings_payload),
-                    "model_used": model_used,
-                    "pdf_size_bytes": pdf_size_bytes,
-                    "approx_llm_tokens": approx_llm_tokens,
-                    "error_message": None,
-                },
-            )
-            succeeded += 1
+            with db_lock:
+                insert_company_row(
+                    conn,
+                    {
+                        "run_id": run_id,
+                        "source_row_index": item["source_row_index"],
+                        "group_uid": item.get("group_uid"),
+                        "group_id": item.get("group_id"),
+                        "group_name": item.get("group_name"),
+                        "company_number": company_number,
+                        "company_name": profile.get("company_name"),
+                        "status": "success",
+                        "document_id": document_id,
+                        "pdf_path": pdf_path,
+                        "profile_json_path": str(profile_path),
+                        "filing_history_json_path": str(filing_history_path),
+                        "extraction_json_path": str(extraction_path),
+                        "warnings_json_path": str(warnings_path),
+                        "profile_json": json.dumps(profile),
+                        "filing_history_json": json.dumps(filing_history),
+                        "extraction_json": json.dumps(extraction_payload),
+                        "warnings_json": json.dumps(warnings_payload),
+                        "model_used": model_used,
+                        "pdf_size_bytes": pdf_size_bytes,
+                        "approx_llm_tokens": approx_llm_tokens,
+                        "error_message": None,
+                    },
+                )
+
+            with counters_lock:
+                succeeded += 1
+
             summary_row.update(
                 {
                     "status": "success",
                     "companies_house_stage": stage,
                     "company_name": profile.get("company_name"),
                     "document_id": document_id,
-                    "pdf_path": str(pdf_path),
+                    "pdf_path": pdf_path,
                     "pdf_size_bytes": pdf_size_bytes,
                     "approx_llm_tokens": approx_llm_tokens,
                     "model_used": model_used,
@@ -823,39 +940,46 @@ def main() -> int:
                     "error": None,
                 }
             )
-            print(f"{prefix} success document_id={document_id} model={model_used}")
+            with print_lock:
+                print(
+                    f"{prefix} success document_id={document_id} model={model_used}"
+                )
         except Exception as exc:
-            failed += 1
             error_message = "".join(
                 traceback.format_exception(exc.__class__, exc, exc.__traceback__)
             )[:MAX_ERROR_TRACEBACK_CHARS]
-            insert_company_row(
-                conn,
-                {
-                    "run_id": run_id,
-                    "source_row_index": item["source_row_index"],
-                    "group_uid": item.get("group_uid"),
-                    "group_id": item.get("group_id"),
-                    "group_name": item.get("group_name"),
-                    "company_number": company_number,
-                    "company_name": None,
-                    "status": "failed",
-                    "document_id": None,
-                    "pdf_path": None,
-                    "profile_json_path": None,
-                    "filing_history_json_path": None,
-                    "extraction_json_path": None,
-                    "warnings_json_path": None,
-                    "profile_json": None,
-                    "filing_history_json": None,
-                    "extraction_json": None,
-                    "warnings_json": None,
-                    "model_used": None,
-                    "pdf_size_bytes": None,
-                    "approx_llm_tokens": None,
-                    "error_message": error_message,
-                },
-            )
+            with db_lock:
+                insert_company_row(
+                    conn,
+                    {
+                        "run_id": run_id,
+                        "source_row_index": item["source_row_index"],
+                        "group_uid": item.get("group_uid"),
+                        "group_id": item.get("group_id"),
+                        "group_name": item.get("group_name"),
+                        "company_number": company_number,
+                        "company_name": None,
+                        "status": "failed",
+                        "document_id": None,
+                        "pdf_path": None,
+                        "profile_json_path": None,
+                        "filing_history_json_path": None,
+                        "extraction_json_path": None,
+                        "warnings_json_path": None,
+                        "profile_json": None,
+                        "filing_history_json": None,
+                        "extraction_json": None,
+                        "warnings_json": None,
+                        "model_used": None,
+                        "pdf_size_bytes": None,
+                        "approx_llm_tokens": None,
+                        "error_message": error_message,
+                    },
+                )
+
+            with counters_lock:
+                failed += 1
+
             summary_row.update(
                 {
                     "status": "failed",
@@ -863,8 +987,44 @@ def main() -> int:
                     "error": str(exc),
                 }
             )
-            print(f"{prefix} failed error={exc}")
-        company_summaries.append(summary_row)
+            with print_lock:
+                print(f"{prefix} failed error={exc}")
+
+        with counters_lock:
+            processed += 1
+            company_summaries.append(summary_row)
+
+    # -- Producer: single thread doing CH API downloads --
+    def producer() -> None:
+        for seq_num, item in enumerate(batch, start=1):
+            dl_result = _download_company(item, seq_num)
+            download_queue.put((seq_num, item, dl_result))
+        # Send sentinel for each consumer
+        for _ in range(extraction_workers):
+            download_queue.put(None)
+
+    # -- Consumer: extraction worker pulling from queue --
+    def consumer() -> None:
+        while True:
+            msg = download_queue.get()
+            if msg is None:
+                break
+            seq_num, item, dl_result = msg
+            _extract_company(item, seq_num, dl_result)
+
+    producer_thread = threading.Thread(target=producer, name="ch-download-producer")
+    producer_thread.start()
+
+    with ThreadPoolExecutor(
+        max_workers=extraction_workers,
+        thread_name_prefix="llm-extract",
+    ) as pool:
+        futures = [pool.submit(consumer) for _ in range(extraction_workers)]
+        # Wait for all consumers to finish
+        for f in futures:
+            f.result()
+
+    producer_thread.join()
 
     finalize_run(
         conn=conn,
@@ -900,6 +1060,7 @@ def main() -> int:
                 else None
             ),
             "companies_house_request_count": throttle_state["request_count"],
+            "extraction_workers": extraction_workers,
             "total_companies": total_companies,
             "processed": processed,
             "succeeded": succeeded,
