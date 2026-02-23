@@ -3,7 +3,7 @@ import json
 import os
 import re
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any
 
 import requests
 from pydantic import ValidationError
@@ -12,9 +12,13 @@ try:
 except ImportError:
     json_repair_loads = None
 
+from company_type import CompanyType, get_prompt_profile
 from document_extraction_models import (
     AcademyTrustAnnualReport,
+    AnnualReport,
     BalanceSheetEntry,
+    CompanyGovernance,
+    CompanyMetadata,
     DetailedBalanceSheet,
     ExtractionResult,
     ExtractionType,
@@ -28,17 +32,6 @@ from document_extraction_models import (
 
 class DocumentExtractionError(Exception):
     """Raised when a document cannot be parsed or validated for extraction."""
-
-    def __init__(
-        self,
-        message: str,
-        *,
-        raw_response_text: str | None = None,
-        raw_response_payload: Any = None,
-    ) -> None:
-        super().__init__(message)
-        self.raw_response_text = raw_response_text
-        self.raw_response_payload = raw_response_payload
 
 
 class OpenRouterDocumentExtractor:
@@ -54,7 +47,7 @@ class OpenRouterDocumentExtractor:
         api_key: str | None = None,
         model: str = "openrouter/auto",
         max_document_chars: int = 35000,
-        request_timeout_seconds: float = 180.0,
+        company_type: CompanyType = CompanyType.ACADEMY_TRUST,
     ) -> None:
         resolved_key = api_key or os.getenv("OPENROUTER_API_KEY")
         if not resolved_key:
@@ -65,13 +58,11 @@ class OpenRouterDocumentExtractor:
             raise ValueError("model must not be empty")
         if max_document_chars <= 0:
             raise ValueError("max_document_chars must be > 0")
-        if request_timeout_seconds <= 0:
-            raise ValueError("request_timeout_seconds must be > 0")
 
         self.api_key = resolved_key
         self.model = model.strip()
         self.max_document_chars = max_document_chars
-        self.request_timeout_seconds = float(request_timeout_seconds)
+        self.company_type = company_type
 
     def extract(
         self, document_path: str, extraction_types: list[ExtractionType]
@@ -84,24 +75,11 @@ class OpenRouterDocumentExtractor:
             raise DocumentExtractionError(f"Document path does not exist: {document_path}")
 
         payload = self._request_extraction_json(source, requested_types)
-        try:
-            return self._build_result(
-                payload=payload,
-                document_path=document_path,
-                requested_types=requested_types,
-            )
-        except DocumentExtractionError as exc:
-            if exc.raw_response_payload is not None or exc.raw_response_text is not None:
-                raise
-            try:
-                payload_text = json.dumps(payload, ensure_ascii=True)
-            except Exception:
-                payload_text = None
-            raise DocumentExtractionError(
-                str(exc),
-                raw_response_text=payload_text,
-                raw_response_payload=payload,
-            ) from exc
+        return self._build_result(
+            payload=payload,
+            document_path=document_path,
+            requested_types=requested_types,
+        )
 
     def extract_full_accounts(
         self, document_path: str, extraction_types: list[ExtractionType] | None = None
@@ -118,8 +96,8 @@ class OpenRouterDocumentExtractor:
     def _request_extraction_json(
         self, document_path: Path, requested_types: list[ExtractionType]
     ) -> dict[str, Any]:
-        response_format = self._build_response_format(requested_types)
-        system_prompt, user_prompt = self._build_prompts(requested_types)
+        response_format = self._build_response_format(requested_types, self.company_type)
+        system_prompt, user_prompt = self._build_prompts(requested_types, self.company_type)
         file_data = self._build_file_data_url(document_path)
         input_payload = self._build_input_payload(
             user_prompt=user_prompt,
@@ -143,13 +121,7 @@ class OpenRouterDocumentExtractor:
         except Exception as exc:
             raise DocumentExtractionError(f"OpenRouter request failed: {exc}") from exc
 
-        try:
-            response_text = self._response_text_from_completion(response)
-        except DocumentExtractionError as exc:
-            raise DocumentExtractionError(
-                str(exc),
-                raw_response_payload=response,
-            ) from exc
+        response_text = self._response_text_from_completion(response)
         try:
             return self._parse_json_response(response_text)
         except DocumentExtractionError as exc:
@@ -157,51 +129,26 @@ class OpenRouterDocumentExtractor:
             snippet = compact[:400]
             raise DocumentExtractionError(
                 "OpenRouter response was not valid JSON "
-                f"(chars={len(response_text)} snippet={snippet!r})",
-                raw_response_text=response_text,
-                raw_response_payload=response,
+                f"(chars={len(response_text)} snippet={snippet!r})"
             ) from exc
 
     @staticmethod
-    def _build_prompts(requested_types: list[ExtractionType]) -> tuple[str, str]:
+    def _build_prompts(
+        requested_types: list[ExtractionType],
+        company_type: CompanyType = CompanyType.ACADEMY_TRUST,
+    ) -> tuple[str, str]:
+        profile = get_prompt_profile(company_type)
         task_lines: list[str] = []
-        personnel_guardrails = ""
         if ExtractionType.PersonnelDetails in requested_types:
             task_lines.append(
-                "- Extract personnel details with fields: first_name, last_name, job_title, "
-                "organisation_name, organisation_type."
-            )
-            personnel_guardrails = (
-                "For personnel_details, include only currently active non-trustee, non-member "
-                "roles.\n"
-                "Exclude any Member or Trustee rows (including Chair of Trustees).\n"
-                "Exclude people explicitly marked as not current, for example text containing "
-                "`resigned`, `left`, `to DD/MM/YYYY`, `until DD/MM/YYYY`, `ended`, "
-                "`end date`, `former`, or equivalent wording.\n"
-                "If two people hold the same exact role title and one is marked with an end "
-                "date while another is marked as starting later, include only the current "
-                "incumbent.\n"
-                "Set organisation_type to `school` when the person is tied to a specific school "
-                "(for example role text includes a school/academy name, or school leadership roles "
-                "such as Principal/Headteacher/Head of School).\n"
-                "Set organisation_type to `trust` for central/corporate trust roles (for example "
-                "CEO/COO/CFO/Director/Company secretary and other trust-wide corporate roles).\n"
-                "Set organisation_name to the specific school name for school roles. For trust "
-                "roles, set organisation_name to the trust entity (or `Trust (Central)` for "
-                "central-team roles).\n"
+                "- Extract personnel details with fields: first_name, last_name, job_title."
             )
         if ExtractionType.BalanceSheet in requested_types:
             task_lines.append("- Extract balance sheet values as line items.")
         if ExtractionType.Metadata in requested_types:
-            task_lines.append(
-                "- Extract report metadata with trust_name, company_registration_number, "
-                "financial_year_ending, and accounting_officer."
-            )
+            task_lines.append(f"- {profile['metadata_prompt']}")
         if ExtractionType.Governance in requested_types:
-            task_lines.append(
-                "- Extract governance trustees with name, meetings_attended, and "
-                "meetings_possible."
-            )
+            task_lines.append(f"- {profile['governance_prompt']}")
         if ExtractionType.StatementOfFinancialActivities in requested_types:
             task_lines.append(
                 "- Extract statement_of_financial_activities with income and expenditure "
@@ -218,10 +165,9 @@ class OpenRouterDocumentExtractor:
                 "and high_pay_bands."
             )
         if ExtractionType.AcademyTrustAnnualReport in requested_types:
-            task_lines.append(
-                "- Extract academy_trust_annual_report with metadata, governance, "
-                "statement_of_financial_activities, balance_sheet, and staffing_data."
-            )
+            task_lines.append(f"- {profile['annual_report_prompt']}")
+        if ExtractionType.AnnualReport in requested_types:
+            task_lines.append(f"- {profile['annual_report_prompt']}")
 
         system_prompt = (
             "You extract structured data from UK company filing documents. "
@@ -233,15 +179,13 @@ class OpenRouterDocumentExtractor:
             f"Requested extraction types: {[t.name for t in requested_types]}.\n"
             + "\n".join(task_lines)
             + "\n"
-            + personnel_guardrails
-            + "Do not emit a personnel row unless first_name, last_name, and job_title "
+            "Do not emit a personnel row unless first_name, last_name, and job_title "
             "are all present and non-empty.\n"
             "Do not emit a balance_sheet row unless line_item and value are both "
             "present and non-empty.\n"
             "For optional fields like period and currency, use null when the value "
             "is missing.\n"
-            "For academy trust report sections, use null or omit optional fields when "
-            "the filing does not provide a value.\n"
+            f"{profile['optional_fields_hint']}\n"
             "Never use empty-string placeholders for missing values."
         )
         return system_prompt, user_prompt
@@ -293,6 +237,7 @@ class OpenRouterDocumentExtractor:
     @staticmethod
     def _build_response_format(
         requested_types: list[ExtractionType],
+        company_type: CompanyType = CompanyType.ACADEMY_TRUST,
     ) -> dict[str, Any]:
         properties: dict[str, Any] = {}
         required: list[str] = []
@@ -315,25 +260,8 @@ class OpenRouterDocumentExtractor:
                             "type": "string",
                             "description": "Role or title at the company.",
                         },
-                        "organisation_name": {
-                            "type": "string",
-                            "description": (
-                                "Employing organisation name: school/academy name or trust entity."
-                            ),
-                        },
-                        "organisation_type": {
-                            "type": "string",
-                            "enum": ["trust", "school"],
-                            "description": "Whether the role is trust-level or school-level.",
-                        },
                     },
-                    "required": [
-                        "first_name",
-                        "last_name",
-                        "job_title",
-                        "organisation_name",
-                        "organisation_type",
-                    ],
+                    "required": ["first_name", "last_name", "job_title"],
                     "additionalProperties": False,
                 },
             }
@@ -369,11 +297,17 @@ class OpenRouterDocumentExtractor:
             required.append("balance_sheet")
 
         if ExtractionType.Metadata in requested_types:
-            properties["metadata"] = OpenRouterDocumentExtractor._schema_for_metadata()
+            if company_type == CompanyType.GENERIC:
+                properties["metadata"] = OpenRouterDocumentExtractor._schema_for_company_metadata()
+            else:
+                properties["metadata"] = OpenRouterDocumentExtractor._schema_for_metadata()
             required.append("metadata")
 
         if ExtractionType.Governance in requested_types:
-            properties["governance"] = OpenRouterDocumentExtractor._schema_for_governance()
+            if company_type == CompanyType.GENERIC:
+                properties["governance"] = OpenRouterDocumentExtractor._schema_for_company_governance()
+            else:
+                properties["governance"] = OpenRouterDocumentExtractor._schema_for_governance()
             required.append("governance")
 
         if ExtractionType.StatementOfFinancialActivities in requested_types:
@@ -397,6 +331,12 @@ class OpenRouterDocumentExtractor:
                 "academy_trust_annual_report"
             ] = OpenRouterDocumentExtractor._schema_for_academy_trust_annual_report()
             required.append("academy_trust_annual_report")
+
+        if ExtractionType.AnnualReport in requested_types:
+            properties[
+                "annual_report"
+            ] = OpenRouterDocumentExtractor._schema_for_annual_report()
+            required.append("annual_report")
 
         return {
             "type": "json_schema",
@@ -594,6 +534,74 @@ class OpenRouterDocumentExtractor:
         }
 
     @staticmethod
+    def _schema_for_company_metadata() -> dict[str, Any]:
+        return {
+            "type": "object",
+            "properties": {
+                "company_name": {"type": "string"},
+                "company_registration_number": {
+                    "type": "string",
+                    "pattern": "^(?:[0-9]{8}|[A-Za-z]{2}[0-9]{6})$",
+                },
+                "financial_year_ending": {"type": "string", "format": "date"},
+                "accounting_officer": {"type": ["string", "null"]},
+            },
+            "required": [
+                "company_name",
+                "company_registration_number",
+                "financial_year_ending",
+                "accounting_officer",
+            ],
+            "additionalProperties": False,
+        }
+
+    @staticmethod
+    def _schema_for_company_governance() -> dict[str, Any]:
+        return {
+            "type": "object",
+            "properties": {
+                "directors": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "name": {"type": ["string", "null"]},
+                            "meetings_attended": {"type": ["integer", "null"]},
+                            "meetings_possible": {"type": ["integer", "null"]},
+                        },
+                        "required": ["name", "meetings_attended", "meetings_possible"],
+                        "additionalProperties": False,
+                    },
+                }
+            },
+            "required": ["directors"],
+            "additionalProperties": False,
+        }
+
+    @staticmethod
+    def _schema_for_annual_report() -> dict[str, Any]:
+        return {
+            "type": "object",
+            "properties": {
+                "metadata": OpenRouterDocumentExtractor._schema_for_company_metadata(),
+                "governance": OpenRouterDocumentExtractor._schema_for_company_governance(),
+                "statement_of_financial_activities": (
+                    OpenRouterDocumentExtractor._schema_for_statement_of_financial_activities()
+                ),
+                "balance_sheet": OpenRouterDocumentExtractor._schema_for_detailed_balance_sheet(),
+                "staffing_data": OpenRouterDocumentExtractor._schema_for_staffing_data(),
+            },
+            "required": [
+                "metadata",
+                "governance",
+                "statement_of_financial_activities",
+                "balance_sheet",
+                "staffing_data",
+            ],
+            "additionalProperties": False,
+        }
+
+    @staticmethod
     def _response_text_from_completion(response: Any) -> str:
         content = OpenRouterDocumentExtractor._first_choice_message_content(response)
         text = OpenRouterDocumentExtractor._content_to_text(content)
@@ -651,12 +659,7 @@ class OpenRouterDocumentExtractor:
             "Content-Type": "application/json",
         }
         try:
-            response = requests.post(
-                url,
-                headers=headers,
-                json=payload,
-                timeout=self.request_timeout_seconds,
-            )
+            response = requests.post(url, headers=headers, json=payload, timeout=180)
         except requests.RequestException as exc:
             raise DocumentExtractionError(f"Request failed: {exc}") from exc
 
@@ -732,12 +735,13 @@ class OpenRouterDocumentExtractor:
     ) -> ExtractionResult:
         personnel_details: list[PersonnelDetail] | None = None
         balance_sheet: list[BalanceSheetEntry] | None = None
-        metadata: Metadata | None = None
-        governance: Governance | None = None
+        metadata: Metadata | CompanyMetadata | None = None
+        governance: Governance | CompanyGovernance | None = None
         statement_of_financial_activities: StatementOfFinancialActivities | None = None
         detailed_balance_sheet: DetailedBalanceSheet | None = None
         staffing_data: StaffingData | None = None
         academy_trust_annual_report: AcademyTrustAnnualReport | None = None
+        annual_report: AnnualReport | None = None
         validation_warnings: list[str] = []
 
         if ExtractionType.PersonnelDetails in requested_types:
@@ -749,65 +753,50 @@ class OpenRouterDocumentExtractor:
             balance_sheet = self._parse_balance_sheet(raw_balance)
 
         if ExtractionType.Metadata in requested_types:
-            metadata = self._parse_optional_object_section(
-                payload=payload,
-                key="metadata",
-                section_label="metadata",
-                parser=self._parse_metadata,
-                warnings=validation_warnings,
-            )
+            raw_metadata = payload.get("metadata")
+            if self.company_type == CompanyType.GENERIC:
+                metadata = self._parse_company_metadata(raw_metadata)
+            else:
+                metadata = self._parse_metadata(raw_metadata)
 
         if ExtractionType.Governance in requested_types:
-            governance = self._parse_optional_object_section(
-                payload=payload,
-                key="governance",
-                section_label="governance",
-                parser=self._parse_governance,
-                warnings=validation_warnings,
-            )
+            raw_governance = payload.get("governance")
+            if self.company_type == CompanyType.GENERIC:
+                governance = self._parse_company_governance(raw_governance)
+            else:
+                governance = self._parse_governance(raw_governance)
 
         if ExtractionType.StatementOfFinancialActivities in requested_types:
-            statement_of_financial_activities = self._parse_optional_object_section(
-                payload=payload,
-                key="statement_of_financial_activities",
-                section_label="statement_of_financial_activities",
-                parser=self._parse_statement_of_financial_activities,
-                warnings=validation_warnings,
+            raw_sofa = payload.get("statement_of_financial_activities")
+            statement_of_financial_activities = self._parse_statement_of_financial_activities(
+                raw_sofa
             )
 
         if ExtractionType.DetailedBalanceSheet in requested_types:
-            detailed_balance_sheet = self._parse_optional_object_section(
-                payload=payload,
-                key="detailed_balance_sheet",
-                section_label="detailed_balance_sheet",
-                parser=self._parse_detailed_balance_sheet,
-                warnings=validation_warnings,
+            raw_detailed_balance_sheet = payload.get("detailed_balance_sheet")
+            detailed_balance_sheet = self._parse_detailed_balance_sheet(
+                raw_detailed_balance_sheet
             )
 
         if ExtractionType.StaffingData in requested_types:
-            staffing_data = self._parse_optional_object_section(
-                payload=payload,
-                key="staffing_data",
-                section_label="staffing_data",
-                parser=self._parse_staffing_data,
-                warnings=validation_warnings,
-            )
+            raw_staffing_data = payload.get("staffing_data")
+            staffing_data = self._parse_staffing_data(raw_staffing_data)
 
         if ExtractionType.AcademyTrustAnnualReport in requested_types:
-            academy_trust_annual_report = self._parse_optional_object_section(
-                payload=payload,
-                key="academy_trust_annual_report",
-                section_label="academy_trust_annual_report",
-                parser=self._parse_academy_trust_annual_report,
-                warnings=validation_warnings,
+            raw_annual_report = payload.get("academy_trust_annual_report")
+            academy_trust_annual_report = self._parse_academy_trust_annual_report(
+                raw_annual_report
             )
 
-        validation_warnings.extend(
-            self._collect_validation_warnings(
-                statement_of_financial_activities=statement_of_financial_activities,
-                detailed_balance_sheet=detailed_balance_sheet,
-                academy_trust_annual_report=academy_trust_annual_report,
-            )
+        if ExtractionType.AnnualReport in requested_types:
+            raw_annual = payload.get("annual_report")
+            annual_report = self._parse_annual_report(raw_annual)
+
+        validation_warnings = self._collect_validation_warnings(
+            statement_of_financial_activities=statement_of_financial_activities,
+            detailed_balance_sheet=detailed_balance_sheet,
+            academy_trust_annual_report=academy_trust_annual_report,
+            annual_report=annual_report,
         )
 
         try:
@@ -823,39 +812,18 @@ class OpenRouterDocumentExtractor:
                 detailed_balance_sheet=detailed_balance_sheet,
                 staffing_data=staffing_data,
                 academy_trust_annual_report=academy_trust_annual_report,
+                annual_report=annual_report,
                 validation_warnings=validation_warnings,
             )
         except ValidationError as exc:
             raise DocumentExtractionError(f"Invalid extraction result: {exc}") from exc
 
     @staticmethod
-    def _parse_optional_object_section(
-        payload: dict[str, Any],
-        key: str,
-        section_label: str,
-        parser: Callable[[Any], Any],
-        warnings: list[str],
-    ) -> Any | None:
-        raw_value = payload.get(key)
-        if raw_value is None:
-            warnings.append(f"Section `{section_label}` missing/null; set to null.")
-            return None
-        if isinstance(raw_value, str) and not raw_value.strip():
-            warnings.append(f"Section `{section_label}` missing/null; set to null.")
-            return None
-        if not isinstance(raw_value, dict):
-            warnings.append(
-                f"Section `{section_label}` expected object but got "
-                f"{type(raw_value).__name__}; set to null."
-            )
-            return None
-        return parser(raw_value)
-
-    @staticmethod
     def _collect_validation_warnings(
         statement_of_financial_activities: StatementOfFinancialActivities | None,
         detailed_balance_sheet: DetailedBalanceSheet | None,
         academy_trust_annual_report: AcademyTrustAnnualReport | None,
+        annual_report: AnnualReport | None = None,
     ) -> list[str]:
         warnings: list[str] = []
 
@@ -894,6 +862,30 @@ class OpenRouterDocumentExtractor:
                 warnings.append(
                     "Detailed balance sheet differs between top-level `detailed_balance_sheet` "
                     "and `academy_trust_annual_report.balance_sheet`."
+                )
+        if annual_report is not None:
+            if annual_report.statement_of_financial_activities is not None:
+                warnings.extend(
+                    OpenRouterDocumentExtractor._reconcile_sofa(
+                        annual_report.statement_of_financial_activities,
+                        prefix="annual_report.statement_of_financial_activities",
+                    )
+                )
+            if annual_report.balance_sheet is not None:
+                warnings.extend(
+                    OpenRouterDocumentExtractor._reconcile_balance_sheet(
+                        annual_report.balance_sheet,
+                        prefix="annual_report.balance_sheet",
+                    )
+                )
+            if (
+                detailed_balance_sheet is not None
+                and annual_report.balance_sheet is not None
+                and detailed_balance_sheet.model_dump() != annual_report.balance_sheet.model_dump()
+            ):
+                warnings.append(
+                    "Detailed balance sheet differs between top-level `detailed_balance_sheet` "
+                    "and `annual_report.balance_sheet`."
                 )
         return warnings
 
@@ -989,139 +981,13 @@ class OpenRouterDocumentExtractor:
             raise DocumentExtractionError("Expected `personnel_details` to be a list")
         personnel: list[PersonnelDetail] = []
         for index, row in enumerate(raw_personnel):
-            if not isinstance(row, dict):
-                raise DocumentExtractionError(
-                    f"Invalid personnel_details row at index {index}: expected object"
-                )
-            job_title_raw = str(row.get("job_title", "")).strip()
-            inferred_org_name, inferred_org_type = OpenRouterDocumentExtractor._infer_personnel_organisation(
-                job_title_raw
-            )
-            prepared_row = dict(row)
-            prepared_row["organisation_name"] = str(
-                row.get("organisation_name") or inferred_org_name
-            ).strip()
-            prepared_row["organisation_type"] = str(
-                row.get("organisation_type") or inferred_org_type
-            ).strip()
             try:
-                parsed = PersonnelDetail.model_validate(prepared_row)
+                personnel.append(PersonnelDetail.model_validate(row))
             except ValidationError as exc:
                 raise DocumentExtractionError(
                     f"Invalid personnel_details row at index {index}: {exc}"
                 ) from exc
-            if OpenRouterDocumentExtractor._should_exclude_personnel_row(parsed):
-                continue
-            personnel.append(parsed)
-        return OpenRouterDocumentExtractor._drop_superseded_duplicate_titles(personnel)
-
-    @staticmethod
-    def _should_exclude_personnel_row(row: PersonnelDetail) -> bool:
-        title = row.job_title.strip().lower()
-        blocked_titles = {
-            "member",
-            "members",
-            "trustee",
-            "trustees",
-            "chair of trustees",
-        }
-        if title in blocked_titles:
-            return True
-
-        # Exclude rows that indicate a role is no longer current.
-        status_patterns = (
-            r"\bresign(?:ed|ation)?\b",
-            r"\bleft\b",
-            r"\bformer\b",
-            r"\bended\b",
-            r"\bend date\b",
-            r"\buntil\b",
-            r"\bto\s+\d{1,2}[/-]\d{1,2}[/-]\d{2,4}\b",
-            r"\bto\s+\d{4}[/-]\d{1,2}[/-]\d{1,2}\b",
-        )
-        for pattern in status_patterns:
-            if re.search(pattern, title):
-                return True
-        return False
-
-    @staticmethod
-    def _drop_superseded_duplicate_titles(personnel: list[PersonnelDetail]) -> list[PersonnelDetail]:
-        seen_keys: set[tuple[str, str, str]] = set()
-        deduped_reversed: list[PersonnelDetail] = []
-        for row in reversed(personnel):
-            key = (
-                row.organisation_type.strip().lower(),
-                row.organisation_name.strip().lower(),
-                row.job_title.strip().lower(),
-            )
-            if key in seen_keys:
-                continue
-            seen_keys.add(key)
-            deduped_reversed.append(row)
-        return list(reversed(deduped_reversed))
-
-    @staticmethod
-    def _infer_personnel_organisation(job_title: str) -> tuple[str, str]:
-        title = str(job_title or "").strip()
-        if not title:
-            return ("Trust", "trust")
-
-        role_part = title
-        org_part = ""
-        if "," in title:
-            role_part, org_part = [part.strip() for part in title.split(",", 1)]
-
-        role_lower = role_part.lower()
-        org_lower = org_part.lower()
-
-        school_keywords = (
-            "academy",
-            "school",
-            "college",
-            "campus",
-            "provision",
-            "nursery",
-            "pupil referral",
-            "pru",
-        )
-        school_role_keywords = (
-            "principal",
-            "headteacher",
-            "head of school",
-            "assistant head",
-            "deputy head",
-        )
-        trust_role_keywords = (
-            "chief",
-            "officer",
-            "director",
-            "secretary",
-            "finance",
-            "operations",
-            "governance",
-            "central",
-            "trust",
-        )
-
-        if org_part and any(token in org_lower for token in school_keywords):
-            return (org_part, "school")
-
-        if any(token in role_lower for token in school_role_keywords):
-            school_name = org_part if org_part else "School (unspecified)"
-            return (school_name, "school")
-
-        if org_part and "central" in org_lower:
-            return ("Trust (Central)", "trust")
-
-        if any(token in role_lower for token in trust_role_keywords):
-            if org_part and "trust" in org_lower:
-                return (org_part, "trust")
-            return ("Trust (Central)" if "central" in org_lower else "Trust", "trust")
-
-        if org_part and "trust" in org_lower:
-            return (org_part, "trust")
-
-        return ("Trust", "trust")
+        return personnel
 
     @staticmethod
     def _parse_balance_sheet(raw_balance: Any) -> list[BalanceSheetEntry]:
@@ -1152,6 +1018,24 @@ class OpenRouterDocumentExtractor:
             raise DocumentExtractionError("Expected `governance` to be an object")
         try:
             return Governance.model_validate(raw_governance)
+        except ValidationError as exc:
+            raise DocumentExtractionError(f"Invalid governance payload: {exc}") from exc
+
+    @staticmethod
+    def _parse_company_metadata(raw_metadata: Any) -> CompanyMetadata:
+        if not isinstance(raw_metadata, dict):
+            raise DocumentExtractionError("Expected `metadata` to be an object")
+        try:
+            return CompanyMetadata.model_validate(raw_metadata)
+        except ValidationError as exc:
+            raise DocumentExtractionError(f"Invalid metadata payload: {exc}") from exc
+
+    @staticmethod
+    def _parse_company_governance(raw_governance: Any) -> CompanyGovernance:
+        if not isinstance(raw_governance, dict):
+            raise DocumentExtractionError("Expected `governance` to be an object")
+        try:
+            return CompanyGovernance.model_validate(raw_governance)
         except ValidationError as exc:
             raise DocumentExtractionError(f"Invalid governance payload: {exc}") from exc
 
@@ -1203,6 +1087,19 @@ class OpenRouterDocumentExtractor:
         except ValidationError as exc:
             raise DocumentExtractionError(
                 f"Invalid academy_trust_annual_report payload: {exc}"
+            ) from exc
+
+    @staticmethod
+    def _parse_annual_report(raw_annual_report: Any) -> AnnualReport:
+        if not isinstance(raw_annual_report, dict):
+            raise DocumentExtractionError(
+                "Expected `annual_report` to be an object"
+            )
+        try:
+            return AnnualReport.model_validate(raw_annual_report)
+        except ValidationError as exc:
+            raise DocumentExtractionError(
+                f"Invalid annual_report payload: {exc}"
             ) from exc
 
     @staticmethod

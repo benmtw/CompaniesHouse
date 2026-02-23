@@ -42,15 +42,18 @@ Expected usage:
 - `.env`
 - `requirements.txt`
 - `companies_house_client.py`
+- `shared.py`
 - `test_companies_house_client.py`
-- `COMPANIES_HOUSE_API.md`
+- `docs/COMPANIES_HOUSE_API.md`
+- `docs/Prefect.md`
+- `docs/MATFullTReportFormat.md`
 - `AGENTS.md`
+- `CLAUDE.md`
 
 ## Operational Notes
-- Follow `COMPANIES_HOUSE_API.md` as the API contract reference.
-- Keep documentation up to date with code changes. If behavior, APIs, models, env vars, or examples change, update `COMPANIES_HOUSE_API.md` and any related docs in the same change.
+- Follow `docs/COMPANIES_HOUSE_API.md` as the API contract reference.
+- Keep documentation up to date with code changes. If behavior, APIs, models, env vars, or examples change, update `docs/COMPANIES_HOUSE_API.md` and any related docs in the same change.
 - Treat `OPENROUTER_MODEL=openrouter/auto` as high-cost mode. Prefer explicitly configured lower-cost models unless the user explicitly requests auto-routing.
 - Use Windows PowerShell-compatible commands in docs/examples.
 - When looking up information on third-party libraries, query the `context7` MCP server first before attempting web search.
 - For live API/integration runs in Codex, request escalated execution (outside sandbox) and run commands directly with `.\.venv\Scripts\python`.
-- Process monitoring: avoid self-matching patterns like `pgrep -f <pattern>` loops. Capture PID from process start, monitor with `Get-Process -Id <PID>` (PowerShell) or `ps -p <PID>` (bash), and only use `Stop-Process -Id <PID>`/`kill <PID>` when termination is required.

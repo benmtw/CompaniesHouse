@@ -1,35 +1,18 @@
 import base64
-import json
 import os
-import queue
-import sqlite3
 import tempfile
-import threading
-import time
 import unittest
-from pathlib import Path
 from unittest.mock import Mock, patch
 
-from batch_extract_trusts import _extraction_types_for_schema_profile
-from companies_house_full_reports_extraction_pipeline import (
-    GlobalCHThrottle,
-    _create_tables,
-    _enqueue_with_backpressure,
-    _insert_job,
-    _insert_run,
-    _install_global_throttle_on_client,
-    _parse_company_numbers_csv,
-    _update_download_state,
-    _update_extract_state,
-    _update_final_state,
-    _validate_input_xor,
-    _validate_worker_settings,
-)
 from companies_house_client import (
     AcademyTrustAnnualReport,
+    AnnualReport,
     CompaniesHouseApiError,
     CompaniesHouseClient,
+    CompanyGovernance,
+    CompanyMetadata,
     DetailedBalanceSheet,
+    DirectorAttendance,
     DocumentExtractionError,
     ExtractionResult,
     ExtractionType,
@@ -38,6 +21,7 @@ from companies_house_client import (
     OpenRouterDocumentExtractor,
     PersonnelDetail,
 )
+from company_type import CompanyType
 
 
 class DummyResponse:
@@ -261,28 +245,27 @@ class CompaniesHouseClientTests(unittest.TestCase):
         self.assertEqual(latest_appt["document_id"], "new-appt")
 
     def test_download_document_success(self):
+        client = CompaniesHouseClient(api_key="k")
+        client.session.request = Mock(
+            return_value=DummyResponse(ok=True, chunks=[b"hello", b"world"])
+        )
+
         with tempfile.TemporaryDirectory() as tmp:
-            client = CompaniesHouseClient(api_key="k", cache_dir=os.path.join(tmp, "cache"))
-            client.session.request = Mock(
-                return_value=DummyResponse(ok=True, chunks=[b"hello", b"world"])
-            )
             path = os.path.join(tmp, "doc.pdf")
             out = client.download_document("abc123", path)
             self.assertEqual(out, path)
-            self.assertEqual(client.last_download_cache_hit, False)
             with open(path, "rb") as fh:
                 self.assertEqual(fh.read(), b"helloworld")
 
     def test_download_document_error_raises(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            client = CompaniesHouseClient(api_key="k", cache_dir=os.path.join(tmp, "cache"))
-            client.session.request = Mock(
-                return_value=DummyResponse(ok=False, status_code=406, text="not acceptable")
-            )
+        client = CompaniesHouseClient(api_key="k")
+        client.session.request = Mock(
+            return_value=DummyResponse(ok=False, status_code=406, text="not acceptable")
+        )
 
-            with self.assertRaises(CompaniesHouseApiError) as ctx:
-                client.download_document("abc123", os.path.join(tmp, "x.pdf"))
-            self.assertEqual(ctx.exception.status_code, 406)
+        with self.assertRaises(CompaniesHouseApiError) as ctx:
+            client.download_document("abc123", "x.pdf")
+        self.assertEqual(ctx.exception.status_code, 406)
 
     def test_extract_document_id_from_full_url(self):
         self.assertEqual(
@@ -325,142 +308,18 @@ class CompaniesHouseClientTests(unittest.TestCase):
 
     @patch("companies_house_client.time.sleep", return_value=None)
     def test_download_document_retries_on_429(self, _sleep_mock):
+        client = CompaniesHouseClient(api_key="k", max_retries_on_429=1)
+        r1 = DummyResponse(ok=False, status_code=429, text="too many")
+        r2 = DummyResponse(ok=True, status_code=200, chunks=[b"file"])
+        client.session.request = Mock(side_effect=[r1, r2])
+
         with tempfile.TemporaryDirectory() as tmp:
-            client = CompaniesHouseClient(
-                api_key="k",
-                max_retries_on_429=1,
-                cache_dir=os.path.join(tmp, "cache"),
-            )
-            r1 = DummyResponse(ok=False, status_code=429, text="too many")
-            r2 = DummyResponse(ok=True, status_code=200, chunks=[b"file"])
-            client.session.request = Mock(side_effect=[r1, r2])
             path = os.path.join(tmp, "doc.pdf")
             out = client.download_document("abc123", path)
             self.assertEqual(out, path)
             with open(path, "rb") as fh:
                 self.assertEqual(fh.read(), b"file")
         self.assertEqual(client.session.request.call_count, 2)
-
-    def test_download_document_cache_hit_skips_http(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            cache_dir = os.path.join(tmp, "cache")
-            client = CompaniesHouseClient(api_key="k", cache_dir=cache_dir)
-            cache_path = client._cache_file_path("abc123", "application/pdf")
-            cache_path.parent.mkdir(parents=True, exist_ok=True)
-            cache_path.write_bytes(b"cached")
-            client.session.request = Mock()
-
-            out_path = os.path.join(tmp, "out", "doc.pdf")
-            out = client.download_document("abc123", out_path)
-
-            self.assertEqual(out, out_path)
-            self.assertEqual(client.last_download_cache_hit, True)
-            with open(out_path, "rb") as fh:
-                self.assertEqual(fh.read(), b"cached")
-            client.session.request.assert_not_called()
-
-    def test_download_document_cache_miss_populates_cache(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            cache_dir = os.path.join(tmp, "cache")
-            client = CompaniesHouseClient(api_key="k", cache_dir=cache_dir)
-            client.session.request = Mock(
-                return_value=DummyResponse(ok=True, status_code=200, chunks=[b"filedata"])
-            )
-
-            out_path = os.path.join(tmp, "out", "doc.pdf")
-            client.download_document("abc123", out_path)
-
-            cache_path = client._cache_file_path("abc123", "application/pdf")
-            self.assertEqual(client.last_download_cache_hit, False)
-            self.assertTrue(cache_path.exists())
-            self.assertEqual(cache_path.read_bytes(), b"filedata")
-            self.assertEqual(Path(out_path).read_bytes(), b"filedata")
-            client.session.request.assert_called_once()
-
-    def test_download_document_writes_cache_index_when_company_number_provided(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            cache_dir = os.path.join(tmp, "cache")
-            client = CompaniesHouseClient(api_key="k", cache_dir=cache_dir)
-            client.session.request = Mock(
-                return_value=DummyResponse(ok=True, status_code=200, chunks=[b"filedata"])
-            )
-
-            out_path = os.path.join(tmp, "out", "doc.pdf")
-            client.download_document(
-                "abc123",
-                out_path,
-                company_number="09618502",
-            )
-
-            index_path = Path(cache_dir) / "cache_index.jsonl"
-            self.assertTrue(index_path.exists())
-            rows = [json.loads(line) for line in index_path.read_text(encoding="utf-8").splitlines()]
-            self.assertEqual(len(rows), 1)
-            self.assertEqual(rows[0]["document_id"], "abc123")
-            self.assertEqual(rows[0]["company_number"], "09618502")
-            self.assertEqual(rows[0]["accept"], "application/pdf")
-            self.assertEqual(rows[0]["cache_hit"], False)
-
-    def test_download_document_cache_hit_writes_index_entry(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            cache_dir = os.path.join(tmp, "cache")
-            client = CompaniesHouseClient(api_key="k", cache_dir=cache_dir)
-            cache_path = client._cache_file_path("abc123", "application/pdf")
-            cache_path.parent.mkdir(parents=True, exist_ok=True)
-            cache_path.write_bytes(b"cached")
-            client.session.request = Mock()
-
-            out_path = os.path.join(tmp, "out", "doc.pdf")
-            client.download_document(
-                "abc123",
-                out_path,
-                company_number="09618502",
-            )
-
-            index_path = Path(cache_dir) / "cache_index.jsonl"
-            rows = [json.loads(line) for line in index_path.read_text(encoding="utf-8").splitlines()]
-            self.assertEqual(len(rows), 1)
-            self.assertEqual(rows[0]["cache_hit"], True)
-            client.session.request.assert_not_called()
-
-    def test_download_document_uses_cache_on_second_call(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            cache_dir = os.path.join(tmp, "cache")
-            client = CompaniesHouseClient(api_key="k", cache_dir=cache_dir)
-            client.session.request = Mock(
-                return_value=DummyResponse(ok=True, status_code=200, chunks=[b"filedata"])
-            )
-
-            first_out = os.path.join(tmp, "out1", "doc.pdf")
-            second_out = os.path.join(tmp, "out2", "doc.pdf")
-
-            client.download_document("abc123", first_out)
-            self.assertEqual(client.last_download_cache_hit, False)
-            client.session.request.reset_mock()
-            client.download_document("abc123", second_out)
-
-            self.assertEqual(client.last_download_cache_hit, True)
-            client.session.request.assert_not_called()
-            self.assertEqual(Path(second_out).read_bytes(), b"filedata")
-
-    def test_download_document_empty_cache_file_triggers_redownload(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            cache_dir = os.path.join(tmp, "cache")
-            client = CompaniesHouseClient(api_key="k", cache_dir=cache_dir)
-            cache_path = client._cache_file_path("abc123", "application/pdf")
-            cache_path.parent.mkdir(parents=True, exist_ok=True)
-            cache_path.write_bytes(b"")
-
-            client.session.request = Mock(
-                return_value=DummyResponse(ok=True, status_code=200, chunks=[b"fresh"])
-            )
-
-            out_path = os.path.join(tmp, "out", "doc.pdf")
-            client.download_document("abc123", out_path)
-
-            client.session.request.assert_called_once()
-            self.assertEqual(cache_path.read_bytes(), b"fresh")
-            self.assertEqual(Path(out_path).read_bytes(), b"fresh")
 
     @patch("companies_house_client.time.sleep", return_value=None)
     def test_retry_after_header_is_preferred(self, sleep_mock):
@@ -494,8 +353,6 @@ class CompaniesHouseClientTests(unittest.TestCase):
                     first_name="A",
                     last_name="B",
                     job_title="Director",
-                    organisation_name="Trust",
-                    organisation_type="trust",
                 )
             ],
         )
@@ -569,13 +426,7 @@ class OpenRouterDocumentExtractorTests(unittest.TestCase):
         llm_json = """
         {
           "personnel_details": [
-            {
-              "first_name": "Ada",
-              "last_name": "Lovelace",
-              "job_title": "Director",
-              "organisation_name": "Trust",
-              "organisation_type": "trust"
-            }
+            {"first_name": "Ada", "last_name": "Lovelace", "job_title": "Director"}
           ]
         }
         """
@@ -598,8 +449,6 @@ class OpenRouterDocumentExtractorTests(unittest.TestCase):
         self.assertEqual(result.personnel_details[0].first_name, "Ada")
         self.assertEqual(result.personnel_details[0].last_name, "Lovelace")
         self.assertEqual(result.personnel_details[0].job_title, "Director")
-        self.assertEqual(result.personnel_details[0].organisation_name, "Trust")
-        self.assertEqual(result.personnel_details[0].organisation_type, "trust")
         self.assertIsNone(result.balance_sheet)
         self.assertEqual(result.model, "openrouter/auto")
         self.assertEqual(result.requested_types, [ExtractionType.PersonnelDetails])
@@ -621,55 +470,6 @@ class OpenRouterDocumentExtractorTests(unittest.TestCase):
         self.assertIn("file", content[1])
         self.assertTrue(content[1]["file"]["file_data"].startswith("data:"))
         self.assertIn(";base64,", content[1]["file"]["file_data"])
-        prompt_text = content[0]["text"]
-        self.assertIn("Exclude any Member or Trustee rows", prompt_text)
-        self.assertIn("currently active non-trustee, non-member roles", prompt_text)
-        self.assertIn("organisation_name", prompt_text)
-        self.assertIn("organisation_type", prompt_text)
-
-    def test_extract_personnel_filters_non_current_members_and_trustees(self):
-        extractor = OpenRouterDocumentExtractor(api_key="or_key")
-        llm_json = """
-        {
-          "personnel_details": [
-            {"first_name": "A", "last_name": "One", "job_title": "Member"},
-            {"first_name": "B", "last_name": "Two", "job_title": "Trustee"},
-            {"first_name": "C", "last_name": "Three", "job_title": "Chair of Trustees"},
-            {"first_name": "D", "last_name": "Four", "job_title": "Principal (to 31/08/2025)"},
-            {"first_name": "E", "last_name": "Five", "job_title": "Chief Officer resigned 01/09/2025"},
-            {"first_name": "Old", "last_name": "Person", "job_title": "Principal, Torlands Academy"},
-            {"first_name": "New", "last_name": "Person", "job_title": "Principal, Torlands Academy"},
-            {"first_name": "F", "last_name": "Six", "job_title": "Principal"}
-          ]
-        }
-        """
-        response = {
-            "choices": [{"message": {"content": llm_json}}],
-        }
-        extractor._post_openrouter_chat_completion = Mock(return_value=response)
-
-        with tempfile.TemporaryDirectory() as tmp:
-            path = os.path.join(tmp, "full_accounts.txt")
-            with open(path, "w", encoding="utf-8") as fh:
-                fh.write("Sample full accounts text")
-
-            result = extractor.extract(
-                path,
-                extraction_types=[ExtractionType.PersonnelDetails],
-            )
-
-        rows = result.personnel_details or []
-        self.assertEqual(len(rows), 2)
-        self.assertEqual(rows[0].first_name, "New")
-        self.assertEqual(rows[0].last_name, "Person")
-        self.assertEqual(rows[0].job_title, "Principal, Torlands Academy")
-        self.assertEqual(rows[0].organisation_name, "Torlands Academy")
-        self.assertEqual(rows[0].organisation_type, "school")
-        self.assertEqual(rows[1].first_name, "F")
-        self.assertEqual(rows[1].last_name, "Six")
-        self.assertEqual(rows[1].job_title, "Principal")
-        self.assertEqual(rows[1].organisation_name, "School (unspecified)")
-        self.assertEqual(rows[1].organisation_type, "school")
 
     def test_extract_balance_sheet_only(self):
         extractor = OpenRouterDocumentExtractor(api_key="or_key")
@@ -750,36 +550,6 @@ class OpenRouterDocumentExtractorTests(unittest.TestCase):
         self.assertIn("metadata", schema["required"])
         metadata_fields = schema["properties"]["metadata"]["properties"]
         self.assertEqual(metadata_fields["company_registration_number"]["pattern"], "^[0-9]{8}$")
-
-    def test_extract_metadata_pads_7_digit_company_number(self):
-        extractor = OpenRouterDocumentExtractor(api_key="or_key")
-        llm_json = """
-        {
-          "metadata": {
-            "trust_name": "LIFT SCHOOLS",
-            "company_registration_number": "6625091",
-            "financial_year_ending": "2025-08-31",
-            "accounting_officer": "Example Officer"
-          }
-        }
-        """
-        response = {
-            "choices": [{"message": {"content": llm_json}}],
-        }
-        extractor._post_openrouter_chat_completion = Mock(return_value=response)
-
-        with tempfile.TemporaryDirectory() as tmp:
-            path = os.path.join(tmp, "full_accounts.txt")
-            with open(path, "w", encoding="utf-8") as fh:
-                fh.write("Sample full accounts text")
-
-            result = extractor.extract(
-                path,
-                extraction_types=[ExtractionType.Metadata],
-            )
-
-        self.assertIsNotNone(result.metadata)
-        self.assertEqual(result.metadata.company_registration_number, "06625091")
 
     def test_extract_academy_trust_annual_report_only(self):
         extractor = OpenRouterDocumentExtractor(api_key="or_key")
@@ -1110,15 +880,52 @@ class OpenRouterDocumentExtractorTests(unittest.TestCase):
         self.assertNotIn("academy_trust_annual_report", schema["required"])
         self.assertNotIn("balance_sheet", schema["required"])
 
-    def test_extract_allows_missing_detailed_balance_sheet_with_warning(self):
-        extractor = OpenRouterDocumentExtractor(api_key="or_key")
+    def test_extract_generic_annual_report(self):
+        extractor = OpenRouterDocumentExtractor(
+            api_key="or_key", company_type=CompanyType.GENERIC
+        )
         llm_json = """
         {
-          "metadata": {
-            "trust_name": "ACE LEARNING",
-            "company_registration_number": "08681270",
-            "financial_year_ending": "2025-08-31",
-            "accounting_officer": "Example Officer"
+          "annual_report": {
+            "metadata": {
+              "company_name": "ACME WIDGETS LTD",
+              "company_registration_number": "12345678",
+              "financial_year_ending": "2024-12-31",
+              "accounting_officer": "John Doe"
+            },
+            "governance": {
+              "directors": [
+                {"name": "Alice Smith", "meetings_attended": 10, "meetings_possible": 12}
+              ]
+            },
+            "statement_of_financial_activities": {
+              "income": {
+                "donations_and_capital_grants": null,
+                "charitable_activities_education": null,
+                "other_trading_activities": null,
+                "investments": null
+              },
+              "expenditure": {
+                "charitable_activities_education": null
+              }
+            },
+            "balance_sheet": {
+              "fixed_assets": 500000,
+              "current_assets": {
+                "debtors": 100000,
+                "cash_at_bank": 250000
+              },
+              "liabilities": {
+                "creditors_within_one_year": 75000,
+                "pension_scheme_liability": 25000
+              },
+              "net_assets": 750000
+            },
+            "staffing_data": {
+              "average_headcount_fte": 50,
+              "total_staff_costs": 2000000,
+              "high_pay_bands": []
+            }
           }
         }
         """
@@ -1134,21 +941,91 @@ class OpenRouterDocumentExtractorTests(unittest.TestCase):
 
             result = extractor.extract(
                 path,
-                extraction_types=[
-                    ExtractionType.Metadata,
-                    ExtractionType.DetailedBalanceSheet,
-                ],
+                extraction_types=[ExtractionType.AnnualReport],
             )
 
-        self.assertIsNotNone(result.metadata)
-        self.assertIsNone(result.detailed_balance_sheet)
-        self.assertTrue(
-            any(
-                "Section `detailed_balance_sheet` missing/null; set to null."
-                in warning
-                for warning in result.validation_warnings
-            )
+        self.assertIsNotNone(result.annual_report)
+        self.assertIsInstance(result.annual_report, AnnualReport)
+        self.assertIsInstance(result.annual_report.metadata, CompanyMetadata)
+        self.assertEqual(result.annual_report.metadata.company_name, "ACME WIDGETS LTD")
+        self.assertEqual(
+            result.annual_report.metadata.company_registration_number, "12345678"
         )
+        self.assertIsInstance(result.annual_report.governance, CompanyGovernance)
+        self.assertEqual(len(result.annual_report.governance.directors), 1)
+        self.assertIsInstance(
+            result.annual_report.governance.directors[0], DirectorAttendance
+        )
+        self.assertEqual(
+            result.annual_report.governance.directors[0].meetings_attended, 10
+        )
+        self.assertEqual(
+            result.annual_report.balance_sheet.current_assets.cash_at_bank, 250000
+        )
+        payload = extractor._post_openrouter_chat_completion.call_args[1]["payload"]
+        schema = payload["response_format"]["json_schema"]["schema"]
+        self.assertIn("annual_report", schema["required"])
+        report_props = schema["properties"]["annual_report"]["properties"]
+        self.assertIn("company_name", report_props["metadata"]["properties"])
+        self.assertIn("directors", report_props["governance"]["properties"])
+        self.assertEqual(
+            report_props["metadata"]["properties"]["company_registration_number"]["pattern"],
+            "^(?:[0-9]{8}|[A-Za-z]{2}[0-9]{6})$",
+        )
+
+    def test_extract_generic_annual_report_accepts_prefixed_company_number(self):
+        extractor = OpenRouterDocumentExtractor(
+            api_key="or_key", company_type=CompanyType.GENERIC
+        )
+        llm_json = """
+        {
+          "annual_report": {
+            "metadata": {
+              "company_name": "ACME SCOTLAND LTD",
+              "company_registration_number": "sc123456",
+              "financial_year_ending": "2024-12-31",
+              "accounting_officer": "John Doe"
+            },
+            "governance": {"directors": []},
+            "statement_of_financial_activities": {"income": {}, "expenditure": {}},
+            "balance_sheet": {
+              "fixed_assets": null,
+              "current_assets": null,
+              "liabilities": null,
+              "net_assets": null
+            },
+            "staffing_data": {"average_headcount_fte": null, "total_staff_costs": null, "high_pay_bands": []}
+          }
+        }
+        """
+        response = {"choices": [{"message": {"content": llm_json}}]}
+        extractor._post_openrouter_chat_completion = Mock(return_value=response)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "full_accounts.txt")
+            with open(path, "w", encoding="utf-8") as fh:
+                fh.write("Sample full accounts text")
+
+            result = extractor.extract(path, extraction_types=[ExtractionType.AnnualReport])
+
+        self.assertEqual(
+            result.annual_report.metadata.company_registration_number,
+            "SC123456",
+        )
+
+    def test_generic_company_type_prompts_use_company_terms(self):
+        _, user_prompt = OpenRouterDocumentExtractor._build_prompts(
+            [ExtractionType.AnnualReport], CompanyType.GENERIC
+        )
+        self.assertIn("annual_report", user_prompt)
+        self.assertIn("annual report sections", user_prompt)
+
+    def test_academy_trust_company_type_prompts_use_trust_terms(self):
+        _, user_prompt = OpenRouterDocumentExtractor._build_prompts(
+            [ExtractionType.AcademyTrustAnnualReport], CompanyType.ACADEMY_TRUST
+        )
+        self.assertIn("academy_trust_annual_report", user_prompt)
+        self.assertIn("academy trust report sections", user_prompt)
 
     def test_extract_rejects_missing_personnel_fields(self):
         extractor = OpenRouterDocumentExtractor(api_key="or_key")
@@ -1191,129 +1068,6 @@ class OpenRouterDocumentExtractorTests(unittest.TestCase):
         self.assertEqual(out["personnel_details"], [])
         self.assertEqual(out["balance_sheet"], [])
         mocked.assert_called()
-
-
-class FullReportsExtractionPipelineTests(unittest.TestCase):
-    def test_schema_profile_personnel_only_maps_to_personnel_details(self):
-        types = _extraction_types_for_schema_profile("personnel_only")
-        self.assertEqual(types, [ExtractionType.PersonnelDetails])
-
-    def test_parse_company_numbers_csv_normalizes_and_dedupes(self):
-        parsed = _parse_company_numbers_csv(" 9618502,09618502, ABC, 08496504 ,")
-        self.assertEqual(parsed, ["09618502", "08496504"])
-
-    def test_validate_input_xor_rejects_both_and_neither(self):
-        with self.assertRaises(ValueError):
-            _validate_input_xor("", "")
-        with self.assertRaises(ValueError):
-            _validate_input_xor("Trusts.xlsx", "09618502")
-        _validate_input_xor("Trusts.xlsx", "")
-        _validate_input_xor("", "09618502")
-
-    def test_validate_worker_settings_rejects_invalid_values(self):
-        with self.assertRaises(ValueError):
-            _validate_worker_settings(0, 1, 1)
-        with self.assertRaises(ValueError):
-            _validate_worker_settings(1, 0, 1)
-        with self.assertRaises(ValueError):
-            _validate_worker_settings(1, 1, 0)
-        _validate_worker_settings(1, 1, 1)
-
-    def test_shared_throttle_enforces_global_spacing_and_count(self):
-        client = CompaniesHouseClient(api_key="k")
-        client.session.request = Mock(return_value=DummyResponse())
-        throttle = GlobalCHThrottle(min_interval_seconds=0.05, lock=threading.Lock())
-        _install_global_throttle_on_client(client, throttle)
-
-        started = time.monotonic()
-        client.session.request("GET", "https://example.test/1")
-        client.session.request("GET", "https://example.test/2")
-        elapsed = time.monotonic() - started
-
-        self.assertGreaterEqual(elapsed, 0.04)
-        self.assertEqual(throttle.request_count, 2)
-
-    def test_bounded_queue_backpressure(self):
-        work_queue: queue.Queue[object] = queue.Queue(maxsize=1)
-        work_queue.put({"job": 1})
-        shutdown = threading.Event()
-        pushed = threading.Event()
-
-        def producer() -> None:
-            ok = _enqueue_with_backpressure(work_queue, {"job": 2}, shutdown, timeout_seconds=0.01)
-            if ok:
-                pushed.set()
-
-        thread = threading.Thread(target=producer)
-        thread.start()
-        time.sleep(0.05)
-        self.assertFalse(pushed.is_set())
-        self.assertEqual(work_queue.get()["job"], 1)
-        thread.join(timeout=1.0)
-        self.assertTrue(pushed.is_set())
-        self.assertEqual(work_queue.get()["job"], 2)
-
-    def test_job_state_transitions_persist_terminal_states(self):
-        conn = sqlite3.connect(":memory:")
-        _create_tables(conn)
-        run_id = _insert_run(
-            conn,
-            {
-                "mode": "all",
-                "input_source_type": "company_numbers",
-                "input_source_value": "09618502",
-                "output_run_dir": "output/run_test",
-                "model": "m",
-                "fallback_models_json": "[]",
-                "schema_profile": "compact_single_call",
-                "ch_workers": 2,
-                "or_workers": 4,
-                "max_pending_extractions": 10,
-                "ch_min_request_interval_seconds": 0.0,
-                "filing_history_items_per_page": 100,
-                "retries_on_invalid_json": 2,
-                "openrouter_timeout_seconds": 180.0,
-                "total_jobs": 1,
-            },
-        )
-        _insert_job(
-            conn,
-            {
-                "run_id": run_id,
-                "job_index": 1,
-                "company_number": "09618502",
-                "download_status": "pending",
-                "extract_status": "pending",
-                "final_status": "pending",
-            },
-        )
-        _update_download_state(conn, run_id, 1, "running", {"download_attempts": 1})
-        _update_download_state(
-            conn,
-            run_id,
-            1,
-            "success",
-            {"document_id": "doc-1", "pdf_path": "a.pdf", "download_error": None},
-        )
-        _update_extract_state(conn, run_id, 1, "running", {"extract_attempts": 1})
-        _update_extract_state(conn, run_id, 1, "failed", {"extract_error": "bad json"})
-        _update_final_state(conn, run_id, 1, "failed", "bad json")
-
-        row = conn.execute(
-            """
-            SELECT download_status, extract_status, final_status, document_id, extract_error, final_error
-            FROM pipeline_jobs
-            WHERE run_id = ? AND job_index = 1
-            """,
-            (run_id,),
-        ).fetchone()
-        self.assertEqual(row[0], "success")
-        self.assertEqual(row[1], "failed")
-        self.assertEqual(row[2], "failed")
-        self.assertEqual(row[3], "doc-1")
-        self.assertEqual(row[4], "bad json")
-        self.assertEqual(row[5], "bad json")
-        conn.close()
 
 
 class CompaniesHouseLiveSmokeTest(unittest.TestCase):
