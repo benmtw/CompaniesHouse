@@ -66,6 +66,9 @@ class PersonnelDetail(BaseModel):
     first_name: str
     last_name: str
     job_title: str
+    organisation_name: str | None = None
+    organisation_type: str | None = None
+    standardised_job_title: str | None = None
 
     @field_validator("first_name", "last_name", "job_title")
     @classmethod
@@ -73,6 +76,16 @@ class PersonnelDetail(BaseModel):
         cleaned = str(value).strip()
         if not cleaned:
             raise ValueError("must not be empty")
+        return cleaned
+
+    @field_validator("organisation_type")
+    @classmethod
+    def _validate_organisation_type(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        cleaned = str(value).strip().lower()
+        if cleaned not in {"trust", "school"}:
+            raise ValueError("organisation_type must be 'trust' or 'school'")
         return cleaned
 
 

@@ -127,6 +127,10 @@ def read_xlsx_rows(xlsx_path: Path) -> list[dict[str, str]]:
         if not target:
             return []
 
+        # Handle both relative (worksheets/sheet1.xml) and absolute (/xl/worksheets/sheet1.xml) targets
+        target = target.lstrip("/")
+        if target.startswith("xl/"):
+            target = target[3:]
         worksheet = ET.fromstring(zf.read(f"xl/{target}"))
         row_nodes = worksheet.findall(".//a:sheetData/a:row", ns)
         if not row_nodes:
@@ -326,8 +330,8 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--schema-profile",
-        choices=["compact_single_call", "full_legacy", "light_core"],
-        default=os.getenv("BATCH_SCHEMA_PROFILE", "compact_single_call"),
+        choices=["compact_single_call", "full_legacy", "light_core", "personnel_only"],
+        default=os.getenv("BATCH_SCHEMA_PROFILE", "personnel_only"),
         help=(
             "Extraction schema profile. "
             "compact_single_call minimizes nesting while keeping broad coverage."
@@ -671,11 +675,27 @@ def main() -> int:
             summary_row["document_id"] = document_id
 
             pdf_path = doc_dir / f"{company_number}_latest_full_accounts_{document_id}.pdf"
-            downloaded_path = client.download_document(
-                document_id=document_id,
-                output_path=str(pdf_path),
-                accept="application/pdf",
-            )
+
+            # Check for existing PDF in any previous run for this document_id
+            existing_pdf = None
+            for run_dir in sorted(Path(output_root).glob("run_*"), reverse=True):
+                candidate = run_dir / company_number / "documents" / f"{company_number}_latest_full_accounts_{document_id}.pdf"
+                if candidate.exists():
+                    existing_pdf = candidate
+                    break
+
+            if existing_pdf:
+                import shutil
+                doc_dir.mkdir(parents=True, exist_ok=True)
+                shutil.copy(existing_pdf, pdf_path)
+                downloaded_path = str(pdf_path)
+                print(f"{prefix} using cached PDF from: {existing_pdf}")
+            else:
+                downloaded_path = client.download_document(
+                    document_id=document_id,
+                    output_path=str(pdf_path),
+                    accept="application/pdf",
+                )
             stage = "download_ok"
             pdf_size_bytes = Path(downloaded_path).stat().st_size
             approx_llm_tokens = estimate_llm_tokens_for_pdf_bytes(pdf_size_bytes)

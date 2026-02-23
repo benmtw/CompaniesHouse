@@ -7,7 +7,9 @@ Consolidates duplicated helper functions that were previously defined in
 
 import json
 import math
+import os
 import sqlite3
+import tempfile
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -111,6 +113,7 @@ def is_full_accounts_filing(item: dict[str, Any]) -> bool:
         return False
     return (
         "accounts-with-accounts-type-full" in description
+        or "accounts-with-accounts-type-group" in description
         or "full" in description
         or "group of companies" in description
     )
@@ -183,6 +186,8 @@ def extraction_types_for_schema_profile(
             ExtractionType.Metadata,
             ExtractionType.Governance,
         ]
+    if schema_profile == "personnel_only":
+        return [ExtractionType.PersonnelDetails]
     raise ValueError(f"Unsupported schema_profile: {schema_profile}")
 
 
@@ -212,17 +217,45 @@ def derive_annual_report_from_component_sections(
     }
 
 
-def extract_with_model_fallback(
+def truncate_pdf(source_path: str, max_pages: int = 20) -> str | None:
+    """Create a truncated copy of a PDF keeping only the first *max_pages* pages.
+
+    Returns the path to the truncated file, or ``None`` if the PDF already has
+    *max_pages* or fewer pages (no point retrying with the same content).
+    """
+    from pypdf import PdfReader, PdfWriter
+
+    reader = PdfReader(source_path)
+    if len(reader.pages) <= max_pages:
+        return None
+
+    writer = PdfWriter()
+    for page in reader.pages[:max_pages]:
+        writer.add_page(page)
+
+    src = Path(source_path)
+    fd, tmp_path = tempfile.mkstemp(suffix="_truncated.pdf", dir=str(src.parent))
+    try:
+        with os.fdopen(fd, "wb") as f:
+            writer.write(f)
+    except BaseException:
+        os.unlink(tmp_path)
+        raise
+    return tmp_path
+
+
+def _run_model_loop(
     api_key: str,
     model_candidates: list[str],
     document_path: str,
     extraction_types: list[ExtractionType],
-    retries_on_invalid_json: int = 2,
-    company_type: CompanyType = CompanyType.GENERIC,
+    retries_on_invalid_json: int,
+    company_type: CompanyType,
 ) -> tuple[dict[str, Any], list[str], str]:
-    """Try each model in order, with JSON-retry logic per model.
+    """Inner model loop: try each model with JSON-retry logic.
 
     Returns ``(extraction_payload, warnings, model_used)``.
+    Raises ``DocumentExtractionError`` on failure.
     """
     errors: list[str] = []
     for model in model_candidates:
@@ -251,6 +284,49 @@ def extract_with_model_fallback(
             + " | ".join(errors)
         )
     raise DocumentExtractionError("No models configured for extraction")
+
+
+def extract_with_model_fallback(
+    api_key: str,
+    model_candidates: list[str],
+    document_path: str,
+    extraction_types: list[ExtractionType],
+    retries_on_invalid_json: int = 2,
+    company_type: CompanyType = CompanyType.GENERIC,
+    max_pages_on_retry: int = 20,
+) -> tuple[dict[str, Any], list[str], str]:
+    """Try each model in order, with JSON-retry logic per model.
+
+    If all models fail with a ``DocumentExtractionError`` that is not a
+    file-not-supported or invalid-JSON error, retry once with the PDF
+    truncated to *max_pages_on_retry* pages.
+
+    Returns ``(extraction_payload, warnings, model_used)``.
+    """
+    try:
+        return _run_model_loop(
+            api_key, model_candidates, document_path,
+            extraction_types, retries_on_invalid_json, company_type,
+        )
+    except DocumentExtractionError as original_exc:
+        if is_file_not_supported_error(original_exc):
+            raise
+        truncated_path = truncate_pdf(document_path, max_pages=max_pages_on_retry)
+        if truncated_path is None:
+            raise
+        try:
+            print(f"[truncation-retry] Retrying with first {max_pages_on_retry} pages: {document_path}")
+            return _run_model_loop(
+                api_key, model_candidates, truncated_path,
+                extraction_types, retries_on_invalid_json, company_type,
+            )
+        except DocumentExtractionError:
+            raise original_exc
+        finally:
+            try:
+                os.unlink(truncated_path)
+            except OSError:
+                pass
 
 
 # ── Database operations ────────────────────────────────────────────────────────
