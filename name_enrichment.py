@@ -10,11 +10,51 @@ import re
 from pathlib import Path
 from typing import Any
 
+import threading
+
 from nameparser import HumanName
 
 logger = logging.getLogger(__name__)
 
 DEFAULT_ENRICHMENT_CACHE_DIR = "output/enrichment_cache"
+
+# Module-level DSPy state — configured once on the main thread, reused by workers.
+_dspy_lock = threading.Lock()
+_dspy_configured = False
+_dspy_predict = None
+
+
+def configure_dspy(api_key: str) -> None:
+    """Configure DSPy with Gemini on the calling thread (must be main thread).
+
+    Safe to call multiple times — only the first call takes effect.
+    """
+    global _dspy_configured, _dspy_predict
+    with _dspy_lock:
+        if _dspy_configured:
+            return
+        import dspy
+
+        lm = dspy.LM(model="gemini/gemini-flash-lite-latest", api_key=api_key)
+        dspy.configure(lm=lm)
+
+        class PersonLookup(dspy.Signature):
+            """Find the full first name and email of a person at a company."""
+
+            company_name = dspy.InputField()
+            first_name_initial = dspy.InputField()
+            last_name = dspy.InputField()
+            job_title = dspy.InputField()
+            full_first_name: str = dspy.OutputField(
+                desc="the person's full first name, or 'UNKNOWN' if not found"
+            )
+            email: str = dspy.OutputField(
+                desc="the person's work email address, or 'UNKNOWN' if not found"
+            )
+
+        _dspy_predict = dspy.Predict(PersonLookup, tools=[{"googleSearch": {}}])
+        _dspy_configured = True
+        logger.info("DSPy configured for name enrichment")
 
 
 def _is_incomplete_first_name(first_name: str) -> bool:
@@ -110,36 +150,15 @@ def enrich_personnel_names(
 
     logger.info("Cache hits: %d, API calls needed: %d", cache_hits, api_calls_needed)
 
-    # Only import and configure dspy if we actually need API calls
+    # Ensure DSPy is configured (no-op if already done on main thread)
     predict = None
     if api_calls_needed > 0:
         try:
-            import dspy
+            configure_dspy(api_key)
         except ImportError:
             logger.error("dspy is not installed — run: pip install 'dspy>=2.6.0'")
             return personnel
-
-        lm = dspy.LM(
-            model="gemini/gemini-flash-lite-latest",
-            api_key=api_key,
-        )
-        dspy.configure(lm=lm)
-
-        class PersonLookup(dspy.Signature):
-            """Find the full first name and email of a person at a company."""
-
-            company_name = dspy.InputField()
-            first_name_initial = dspy.InputField()
-            last_name = dspy.InputField()
-            job_title = dspy.InputField()
-            full_first_name: str = dspy.OutputField(
-                desc="the person's full first name, or 'UNKNOWN' if not found"
-            )
-            email: str = dspy.OutputField(
-                desc="the person's work email address, or 'UNKNOWN' if not found"
-            )
-
-        predict = dspy.Predict(PersonLookup, tools=[{"googleSearch": {}}])
+        predict = _dspy_predict
 
     # --- Resolve all uncached lookups concurrently ---
     def _lookup(idx: int) -> tuple[int, str | None, str | None, str]:

@@ -654,6 +654,17 @@ def main() -> int:
     extraction_workers = args.extraction_workers
     print(f"[run {run_id}] extraction_workers={extraction_workers}")
 
+    # Pre-configure DSPy on the main thread so worker threads can use it
+    if not args.no_name_enrichment:
+        gemini_key = os.getenv("GEMINI_API_KEY", "").strip()
+        if gemini_key:
+            from name_enrichment import configure_dspy
+
+            try:
+                configure_dspy(gemini_key)
+            except Exception as exc:
+                print(f"[run {run_id}] WARNING: failed to configure name enrichment: {exc}")
+
     # -- shared mutable state protected by locks --
     counters_lock = threading.Lock()
     db_lock = threading.Lock()
