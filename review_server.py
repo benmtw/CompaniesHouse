@@ -223,7 +223,7 @@ def company_detail(report_id):
     # PDF iframe
     has_pdf = bool(row["pdf_path"] and Path(row["pdf_path"]).exists())
     pdf_html = (
-        f'<iframe src="/pdf/{report_id}" type="application/pdf"></iframe>'
+        f'<iframe src="/pdfview/{report_id}" style="width:100%;height:100%;border:none;"></iframe>'
         if has_pdf
         else "<p>No PDF available</p>"
     )
@@ -285,6 +285,43 @@ def company_detail(report_id):
 </body></html>""")
 
 
+@app.route("/pdfview/<int:report_id>")
+def pdf_viewer(report_id):
+    """Render a minimal PDF.js viewer without sidebar."""
+    return render_template_string("""<!DOCTYPE html>
+<html><head>
+<meta charset="utf-8">
+<style>
+  * { margin: 0; padding: 0; }
+  html, body { height: 100%; overflow: hidden; }
+  #pdf-container { width: 100%; height: 100%; overflow-y: auto; background: #525659; }
+  canvas { display: block; margin: 4px auto; box-shadow: 0 2px 8px rgba(0,0,0,0.3); }
+</style>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/4.2.67/pdf.min.mjs" type="module"></script>
+</head>
+<body>
+<div id="pdf-container"></div>
+<script type="module">
+  const pdfjsLib = await import("https://cdnjs.cloudflare.com/ajax/libs/pdf.js/4.2.67/pdf.min.mjs");
+  pdfjsLib.GlobalWorkerOptions.workerSrc = "https://cdnjs.cloudflare.com/ajax/libs/pdf.js/4.2.67/pdf.worker.min.mjs";
+
+  const pdf = await pdfjsLib.getDocument("/pdf/{{ report_id }}").promise;
+  const container = document.getElementById("pdf-container");
+
+  for (let i = 1; i <= pdf.numPages; i++) {
+    const page = await pdf.getPage(i);
+    const scale = (container.clientWidth - 16) / page.getViewport({scale: 1}).width;
+    const viewport = page.getViewport({scale});
+    const canvas = document.createElement("canvas");
+    canvas.width = viewport.width;
+    canvas.height = viewport.height;
+    container.appendChild(canvas);
+    await page.render({canvasContext: canvas.getContext("2d"), viewport}).promise;
+  }
+</script>
+</body></html>""", report_id=report_id)
+
+
 @app.route("/pdf/<int:report_id>")
 def serve_pdf(report_id):
     db = get_db()
@@ -319,16 +356,22 @@ def _render_extraction(extraction_json_raw):
     if personnel and isinstance(personnel, list):
         parts.append("<h3>Personnel Details</h3>")
         parts.append('<table class="personnel-table"><thead><tr>'
-                     "<th>Name</th><th>Job Title</th><th>Standardised Title</th>"
-                     "<th>Organisation</th></tr></thead><tbody>")
+                     "<th>Name</th><th>First (Extracted)</th><th>First (Enriched)</th>"
+                     "<th>Job Title</th><th>Standardised Title</th>"
+                     "<th>Organisation</th><th>Email</th></tr></thead><tbody>")
         for p in personnel:
             first = p.get("first_name", "")
             last = p.get("last_name", "")
+            extracted = p.get("first_name_extracted", "") or ""
+            enriched = p.get("first_name_enriched", "") or ""
             title = p.get("job_title", "")
             std = p.get("standardised_job_title", "") or ""
             org = p.get("organisation_name", "") or ""
-            parts.append(f"<tr><td>{first} {last}</td><td>{title}</td>"
-                         f"<td>{std}</td><td>{org}</td></tr>")
+            email = p.get("email", "") or ""
+            parts.append(f"<tr><td>{first} {last}</td>"
+                         f"<td>{extracted}</td><td>{enriched}</td>"
+                         f"<td>{title}</td><td>{std}</td>"
+                         f"<td>{org}</td><td>{email}</td></tr>")
         parts.append("</tbody></table>")
 
     # Metadata
