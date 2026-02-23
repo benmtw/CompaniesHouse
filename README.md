@@ -11,6 +11,46 @@ Batch processes UK company filings from XLSX input, downloads PDFs via the [Comp
 - **Prefect orchestration** -- concurrent company processing, rate limiting, secret management, and failure hooks
 - **SQLite persistence** -- per-run tracking with full extraction results, validation warnings, and run metadata
 
+## Installing as a Dependency
+
+To use this package in another project, install it directly from GitHub with pip:
+
+```bash
+# Install from the default branch
+pip install git+https://github.com/benmtw/CompaniesHouse.git
+
+# Install a specific branch
+pip install git+https://github.com/benmtw/CompaniesHouse.git@branch-name
+
+# Install a specific tag or commit
+pip install git+https://github.com/benmtw/CompaniesHouse.git@v0.1.0
+pip install git+https://github.com/benmtw/CompaniesHouse.git@abc1234
+```
+
+If the repository is **private**, use SSH instead:
+
+```bash
+pip install git+ssh://git@github.com/benmtw/CompaniesHouse.git
+```
+
+You can also add it to your project's `requirements.txt`:
+
+```
+# HTTPS (public or with token)
+companies-house-extraction @ git+https://github.com/benmtw/CompaniesHouse.git
+
+# SSH (private repo)
+companies-house-extraction @ git+ssh://git@github.com/benmtw/CompaniesHouse.git
+```
+
+Or in `pyproject.toml` dependencies:
+
+```toml
+dependencies = [
+    "companies-house-extraction @ git+https://github.com/benmtw/CompaniesHouse.git",
+]
+```
+
 ## Quick Start
 
 ### 1. Clone and install

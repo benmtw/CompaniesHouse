@@ -1,0 +1,21 @@
+[build-system]
+requires = ["setuptools>=68.0", "wheel"]
+build-backend = "setuptools.backends._legacy:_Backend"
+
+[project]
+name = "companies-house-extraction"
+version = "0.1.0"
+description = "Companies House data extraction pipeline"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "requests>=2.31.0",
+    "pydantic>=2.7.0",
+    "json-repair>=0.39.0",
+    "prefect>=3.0,<4.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "unittest-xml-reporting",
+]

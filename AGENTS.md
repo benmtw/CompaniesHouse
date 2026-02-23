@@ -12,6 +12,13 @@ This repository manages Companies House data retrieval and document download too
 - Install deps with: `.\.venv\Scripts\python -m pip install -r requirements.txt`
 - Run tests with: `.\.venv\Scripts\python -m unittest -v test_companies_house_client.py`
 
+## Installing as a Dependency
+This package can be pip-installed directly from GitHub for use in other projects:
+```bash
+pip install git+https://github.com/benmtw/CompaniesHouse.git
+```
+For private repo access use SSH: `pip install git+ssh://git@github.com/benmtw/CompaniesHouse.git`
+
 ## Secrets
 - Use `.env` for local secrets.
 - Required key: `CH_API_KEY`
@@ -40,6 +47,7 @@ Expected usage:
 
 ## Project Files to Keep
 - `.env`
+- `pyproject.toml`
 - `requirements.txt`
 - `companies_house_client.py`
 - `shared.py`
