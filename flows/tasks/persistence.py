@@ -2,24 +2,15 @@
 
 import json
 import sqlite3
-from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
 from prefect import task
 
-
-def _utc_now() -> str:
-    return datetime.now(UTC).replace(microsecond=0).isoformat()
-
-
-def _ensure_parent(path: Path) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-
-
-def write_json(path: Path, payload: Any) -> None:
-    _ensure_parent(path)
-    path.write_text(json.dumps(payload, indent=2, ensure_ascii=True), encoding="utf-8")
+from shared import (
+    insert_company_row,
+    write_json,
+)
 
 
 @task(name="save-results", retries=0)
@@ -86,61 +77,32 @@ def save_results(
     write_json(run_report_path, run_report)
 
     conn = sqlite3.connect(db_path, timeout=10)
-    conn.execute(
-        """
-        INSERT INTO company_reports (
-            run_id,
-            source_row_index,
-            group_uid,
-            group_id,
-            group_name,
-            company_number,
-            company_name,
-            status,
-            document_id,
-            pdf_path,
-            profile_json_path,
-            filing_history_json_path,
-            extraction_json_path,
-            warnings_json_path,
-            profile_json,
-            filing_history_json,
-            extraction_json,
-            warnings_json,
-            model_used,
-            pdf_size_bytes,
-            approx_llm_tokens,
-            error_message,
-            created_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        """,
-        (
-            run_id,
-            item["source_row_index"],
-            item.get("group_uid"),
-            item.get("group_id"),
-            item.get("group_name"),
-            company_number,
-            profile.get("company_name"),
-            "success",
-            document_id,
-            pdf_path,
-            str(profile_path),
-            str(filing_history_path),
-            str(extraction_path),
-            str(warnings_path),
-            json.dumps(profile),
-            json.dumps(filing_history),
-            json.dumps(extraction_payload),
-            json.dumps(warnings_payload),
-            model_used,
-            pdf_size_bytes,
-            approx_llm_tokens,
-            None,
-            _utc_now(),
-        ),
+    insert_company_row(
+        conn,
+        {
+            "run_id": run_id,
+            "source_row_index": item["source_row_index"],
+            "group_uid": item.get("group_uid"),
+            "group_id": item.get("group_id"),
+            "group_name": item.get("group_name"),
+            "company_number": company_number,
+            "company_name": profile.get("company_name"),
+            "status": "success",
+            "document_id": document_id,
+            "pdf_path": pdf_path,
+            "profile_json_path": str(profile_path),
+            "filing_history_json_path": str(filing_history_path),
+            "extraction_json_path": str(extraction_path),
+            "warnings_json_path": str(warnings_path),
+            "profile_json": json.dumps(profile),
+            "filing_history_json": json.dumps(filing_history),
+            "extraction_json": json.dumps(extraction_payload),
+            "warnings_json": json.dumps(warnings_payload),
+            "model_used": model_used,
+            "pdf_size_bytes": pdf_size_bytes,
+            "approx_llm_tokens": approx_llm_tokens,
+        },
     )
-    conn.commit()
     conn.close()
 
     return {

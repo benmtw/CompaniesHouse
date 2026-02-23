@@ -8,12 +8,10 @@ OpenRouter LLM calls. SQLite uses WAL mode for concurrent write safety.
 
 import json
 import logging
-import math
 import os
 import sqlite3
 import traceback
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
@@ -21,7 +19,6 @@ from prefect import flow
 
 from companies_house_client import CompaniesHouseClient
 from company_type import CompanyType
-from document_extraction_models import ExtractionType
 from flows.tasks.companies_house import (
     download_document,
     fetch_company_profile,
@@ -29,64 +26,20 @@ from flows.tasks.companies_house import (
 )
 from flows.tasks.data_loading import finalize_run, initialize_run, load_and_prepare_batch
 from flows.tasks.extraction import extract_document, find_latest_full_accounts
-from flows.tasks.persistence import save_results, write_json
-
-
-DEFAULT_INPUT_XLSX = "SourceData/allgroupslinksdata20260217/Trusts.xlsx"
-DEFAULT_OUTPUT_ROOT = "output/companies_extraction"
-MAX_ERROR_TRACEBACK_CHARS = 4000
-
-
-def _extraction_types_for_schema_profile(
-    schema_profile: str,
-    company_type: CompanyType = CompanyType.GENERIC,
-) -> list[ExtractionType]:
-    from batch_extract_companies import _extraction_types_for_schema_profile as _orig
-
-    return _orig(schema_profile, company_type)
-
-
-def _derive_annual_report_from_component_sections(
-    extraction_payload: dict[str, Any],
-) -> dict[str, Any] | None:
-    metadata = extraction_payload.get("metadata")
-    governance = extraction_payload.get("governance")
-    sofa = extraction_payload.get("statement_of_financial_activities")
-    balance_sheet = extraction_payload.get("detailed_balance_sheet")
-    staffing_data = extraction_payload.get("staffing_data")
-    if (
-        metadata is None
-        and governance is None
-        and sofa is None
-        and balance_sheet is None
-        and staffing_data is None
-    ):
-        return None
-    return {
-        "metadata": metadata,
-        "governance": governance,
-        "statement_of_financial_activities": sofa,
-        "balance_sheet": balance_sheet,
-        "staffing_data": staffing_data,
-    }
-
-
-def _estimate_llm_tokens_for_pdf_bytes(pdf_size_bytes: int) -> int:
-    if pdf_size_bytes <= 0:
-        return 0
-    return int(math.ceil(pdf_size_bytes / 4.0))
-
-
-def _parse_fallback_models(raw_models: str) -> list[str]:
-    out: list[str] = []
-    seen: set[str] = set()
-    for part in raw_models.split(","):
-        model = part.strip()
-        if not model or model in seen:
-            continue
-        seen.add(model)
-        out.append(model)
-    return out
+from flows.tasks.persistence import save_results
+from shared import (
+    DEFAULT_INPUT_XLSX,
+    DEFAULT_OUTPUT_ROOT,
+    MAX_ERROR_TRACEBACK_CHARS,
+    deduplicate_ordered,
+    derive_annual_report_from_component_sections,
+    estimate_llm_tokens_for_pdf_bytes,
+    extraction_types_for_schema_profile,
+    insert_company_row,
+    parse_fallback_models,
+    utc_now_iso,
+    write_json,
+)
 
 
 def _insert_failed_company_row(
@@ -97,35 +50,19 @@ def _insert_failed_company_row(
     error_message: str,
 ) -> None:
     conn = sqlite3.connect(db_path, timeout=10)
-    conn.execute(
-        """
-        INSERT INTO company_reports (
-            run_id, source_row_index, group_uid, group_id, group_name,
-            company_number, company_name, status,
-            document_id, pdf_path, profile_json_path, filing_history_json_path,
-            extraction_json_path, warnings_json_path,
-            profile_json, filing_history_json, extraction_json, warnings_json,
-            model_used, pdf_size_bytes, approx_llm_tokens,
-            error_message, created_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        """,
-        (
-            run_id,
-            item["source_row_index"],
-            item.get("group_uid"),
-            item.get("group_id"),
-            item.get("group_name"),
-            company_number,
-            None,
-            "failed",
-            None, None, None, None, None, None,
-            None, None, None, None,
-            None, None, None,
-            error_message,
-            datetime.now(UTC).replace(microsecond=0).isoformat(),
-        ),
+    insert_company_row(
+        conn,
+        {
+            "run_id": run_id,
+            "source_row_index": item["source_row_index"],
+            "group_uid": item.get("group_uid"),
+            "group_id": item.get("group_id"),
+            "group_name": item.get("group_name"),
+            "company_number": company_number,
+            "status": "failed",
+            "error_message": error_message,
+        },
     )
-    conn.commit()
     conn.close()
 
 
@@ -139,7 +76,7 @@ def process_company_flow(
     openrouter_api_key: str,
     model_candidates: list[str],
     model_requested: str,
-    extraction_types: list[ExtractionType],
+    extraction_types: list,
     company_type: CompanyType,
     item: dict,
     run_id: int,
@@ -164,7 +101,7 @@ def process_company_flow(
     downloaded_path = download_document(client, document_id, pdf_path)
 
     pdf_size_bytes = Path(downloaded_path).stat().st_size
-    approx_llm_tokens = _estimate_llm_tokens_for_pdf_bytes(pdf_size_bytes)
+    approx_llm_tokens = estimate_llm_tokens_for_pdf_bytes(pdf_size_bytes)
 
     extraction_payload, warnings, model_used = extract_document(
         openrouter_api_key=openrouter_api_key,
@@ -182,7 +119,7 @@ def process_company_flow(
         else "annual_report"
     )
     if extraction_payload.get(annual_report_key) is None:
-        derived = _derive_annual_report_from_component_sections(extraction_payload)
+        derived = derive_annual_report_from_component_sections(extraction_payload)
         if derived is not None:
             extraction_payload[annual_report_key] = derived
 
@@ -295,18 +232,12 @@ def batch_extract_companies_flow(
         )
 
     ct = CompanyType(company_type)
-    extraction_types = _extraction_types_for_schema_profile(schema_profile, ct)
+    extraction_types = extraction_types_for_schema_profile(schema_profile, ct)
 
     # Build model candidates list
-    model_candidates = [resolved_model] + _parse_fallback_models(fallback_models)
-    deduped_models: list[str] = []
-    seen_models: set[str] = set()
-    for m in model_candidates:
-        if m in seen_models:
-            continue
-        seen_models.add(m)
-        deduped_models.append(m)
-    model_candidates = deduped_models
+    model_candidates = deduplicate_ordered(
+        [resolved_model] + parse_fallback_models(fallback_models)
+    )
 
     # Load and prepare batch
     batch = load_and_prepare_batch(
@@ -441,7 +372,7 @@ def batch_extract_companies_flow(
             "run_type": "batch_extract_companies",
             "company_type": ct.value,
             "run_id": run_id,
-            "timestamp_utc": datetime.now(UTC).replace(microsecond=0).isoformat(),
+            "timestamp_utc": utc_now_iso(),
             "input_xlsx_path": input_xlsx,
             "output_run_dir": output_run_dir,
             "model": resolved_model,

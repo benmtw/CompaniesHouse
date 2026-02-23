@@ -1,6 +1,5 @@
 import argparse
 import json
-import math
 import os
 import random
 import sqlite3
@@ -14,14 +13,28 @@ from zipfile import ZipFile
 
 from companies_house_client import CompaniesHouseClient
 from company_type import CompanyType
-from document_extraction_models import ExtractionType
-from openrouter_document_extractor import DocumentExtractionError, OpenRouterDocumentExtractor
-
-
-DEFAULT_INPUT_XLSX = "SourceData/allgroupslinksdata20260217/Trusts.xlsx"
-DEFAULT_OUTPUT_ROOT = "output/companies_extraction"
-DEFAULT_DB_NAME = "companies_house_extractions.db"
-MAX_ERROR_TRACEBACK_CHARS = 4000
+from openrouter_document_extractor import DocumentExtractionError
+from shared import (
+    DEFAULT_DB_NAME,
+    DEFAULT_INPUT_XLSX,
+    DEFAULT_OUTPUT_ROOT,
+    MAX_ERROR_TRACEBACK_CHARS,
+    create_tables,
+    deduplicate_ordered,
+    derive_annual_report_from_component_sections,
+    ensure_parent,
+    estimate_llm_tokens_for_pdf_bytes,
+    extract_with_model_fallback,
+    extraction_types_for_schema_profile,
+    finalize_run,
+    insert_company_row,
+    insert_run,
+    is_schema_depth_error,
+    latest_full_accounts_document_id,
+    parse_fallback_models,
+    utc_now_iso,
+    write_json,
+)
 
 
 def _load_dotenv_file(env_path: Path) -> None:
@@ -178,49 +191,6 @@ def normalize_company_number(raw_value: str) -> str | None:
     return alnum
 
 
-def _ensure_parent(path: Path) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-
-
-def write_json(path: Path, payload: Any) -> None:
-    _ensure_parent(path)
-    path.write_text(json.dumps(payload, indent=2, ensure_ascii=True), encoding="utf-8")
-
-
-def _utc_now() -> str:
-    return datetime.now(UTC).replace(microsecond=0).isoformat()
-
-
-def _parse_fallback_models(raw_models: str) -> list[str]:
-    out: list[str] = []
-    seen: set[str] = set()
-    for part in raw_models.split(","):
-        model = part.strip()
-        if not model or model in seen:
-            continue
-        seen.add(model)
-        out.append(model)
-    return out
-
-
-def _is_file_not_supported_error(exc: Exception) -> bool:
-    message = str(exc).lower()
-    return (
-        "does not support file content types" in message
-        or "invalid value: 'file'" in message
-        or "messages[1].content[1].type" in message
-    )
-
-
-def _is_invalid_json_error(exc: Exception) -> bool:
-    return "response was not valid json" in str(exc).lower()
-
-
-def _is_schema_depth_error(exc: Exception) -> bool:
-    message = str(exc).lower()
-    return "maximum allowed nesting depth" in message or "schema-depth" in message
-
-
 def _install_companies_house_request_throttle(
     client: CompaniesHouseClient, min_interval_seconds: float
 ) -> dict[str, Any]:
@@ -247,323 +217,6 @@ def _install_companies_house_request_throttle(
 
     client.session.request = throttled_request
     return state
-
-
-def _estimate_llm_tokens_for_pdf_bytes(pdf_size_bytes: int) -> int:
-    """
-    Coarse heuristic only.
-    Uses 4 bytes/token as a generic approximation for reporting.
-    """
-    if pdf_size_bytes <= 0:
-        return 0
-    return int(math.ceil(pdf_size_bytes / 4.0))
-
-
-def _is_full_accounts_filing(item: dict[str, Any]) -> bool:
-    filing_type = str(item.get("type") or "").upper()
-    description = str(item.get("description") or "").lower()
-    if filing_type != "AA":
-        return False
-    return "accounts-with-accounts-type-full" in description or "full" in description
-
-
-def _latest_full_accounts_document_id_from_filing_history(
-    filings: list[dict[str, Any]],
-) -> str | None:
-    candidates: list[dict[str, Any]] = []
-    for item in filings:
-        if not _is_full_accounts_filing(item):
-            continue
-        links = item.get("links") or {}
-        metadata_url = str(links.get("document_metadata") or "").strip()
-        if not metadata_url:
-            continue
-        candidates.append(item)
-
-    if not candidates:
-        return None
-
-    latest_item = sorted(candidates, key=lambda i: (str(i.get("date") or "")), reverse=True)[0]
-    metadata_url = str((latest_item.get("links") or {}).get("document_metadata") or "").strip()
-    return CompaniesHouseClient._extract_document_id(metadata_url)
-
-
-def _extraction_types_for_schema_profile(
-    schema_profile: str,
-    company_type: CompanyType = CompanyType.GENERIC,
-) -> list[ExtractionType]:
-    annual_report_type = (
-        ExtractionType.AcademyTrustAnnualReport
-        if company_type == CompanyType.ACADEMY_TRUST
-        else ExtractionType.AnnualReport
-    )
-    if schema_profile == "full_legacy":
-        return [
-            ExtractionType.PersonnelDetails,
-            ExtractionType.BalanceSheet,
-            ExtractionType.Metadata,
-            ExtractionType.Governance,
-            ExtractionType.StatementOfFinancialActivities,
-            ExtractionType.DetailedBalanceSheet,
-            ExtractionType.StaffingData,
-            annual_report_type,
-        ]
-    if schema_profile == "compact_single_call":
-        return [
-            ExtractionType.PersonnelDetails,
-            ExtractionType.BalanceSheet,
-            ExtractionType.Metadata,
-            ExtractionType.Governance,
-            ExtractionType.StatementOfFinancialActivities,
-            ExtractionType.DetailedBalanceSheet,
-            ExtractionType.StaffingData,
-        ]
-    if schema_profile == "light_core":
-        return [
-            ExtractionType.PersonnelDetails,
-            ExtractionType.BalanceSheet,
-            ExtractionType.Metadata,
-            ExtractionType.Governance,
-        ]
-    raise ValueError(f"Unsupported schema_profile: {schema_profile}")
-
-
-def _derive_annual_report_from_component_sections(
-    extraction_payload: dict[str, Any],
-) -> dict[str, Any] | None:
-    metadata = extraction_payload.get("metadata")
-    governance = extraction_payload.get("governance")
-    sofa = extraction_payload.get("statement_of_financial_activities")
-    balance_sheet = extraction_payload.get("detailed_balance_sheet")
-    staffing_data = extraction_payload.get("staffing_data")
-    if (
-        metadata is None
-        and governance is None
-        and sofa is None
-        and balance_sheet is None
-        and staffing_data is None
-    ):
-        return None
-    return {
-        "metadata": metadata,
-        "governance": governance,
-        "statement_of_financial_activities": sofa,
-        "balance_sheet": balance_sheet,
-        "staffing_data": staffing_data,
-    }
-
-
-def _extract_with_model_fallback(
-    api_key: str,
-    model_candidates: list[str],
-    document_path: str,
-    extraction_types: list[ExtractionType],
-    retries_on_invalid_json: int = 2,
-    company_type: CompanyType = CompanyType.GENERIC,
-) -> tuple[dict[str, Any], list[str], str]:
-    errors: list[str] = []
-    for model in model_candidates:
-        attempts = retries_on_invalid_json + 1
-        for attempt in range(1, attempts + 1):
-            extractor = OpenRouterDocumentExtractor(
-                api_key=api_key, model=model, company_type=company_type
-            )
-            try:
-                result = extractor.extract(
-                    document_path=document_path,
-                    extraction_types=extraction_types,
-                )
-                return result.model_dump(mode="json"), result.validation_warnings or [], model
-            except DocumentExtractionError as exc:
-                if _is_file_not_supported_error(exc):
-                    errors.append(f"{model}: {exc}")
-                    break
-                if _is_invalid_json_error(exc) and attempt < attempts:
-                    errors.append(f"{model} attempt {attempt}/{attempts}: {exc}")
-                    continue
-                raise
-    if errors:
-        raise DocumentExtractionError(
-            "All configured models failed file-input support checks: "
-            + " | ".join(errors)
-        )
-    raise DocumentExtractionError("No models configured for extraction")
-
-
-def _create_tables(conn: sqlite3.Connection) -> None:
-    conn.execute(
-        """
-        CREATE TABLE IF NOT EXISTS runs (
-            run_id INTEGER PRIMARY KEY AUTOINCREMENT,
-            started_at TEXT NOT NULL,
-            finished_at TEXT,
-            input_xlsx_path TEXT NOT NULL,
-            output_run_dir TEXT NOT NULL,
-            model TEXT NOT NULL,
-            extraction_types_json TEXT NOT NULL,
-            total_companies INTEGER NOT NULL DEFAULT 0,
-            processed INTEGER NOT NULL DEFAULT 0,
-            succeeded INTEGER NOT NULL DEFAULT 0,
-            failed INTEGER NOT NULL DEFAULT 0
-        )
-        """
-    )
-    conn.execute(
-        """
-        CREATE TABLE IF NOT EXISTS company_reports (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            run_id INTEGER NOT NULL,
-            source_row_index INTEGER NOT NULL,
-            group_uid TEXT,
-            group_id TEXT,
-            group_name TEXT,
-            company_number TEXT NOT NULL,
-            company_name TEXT,
-            status TEXT NOT NULL,
-            document_id TEXT,
-            pdf_path TEXT,
-            profile_json_path TEXT,
-            filing_history_json_path TEXT,
-            extraction_json_path TEXT,
-            warnings_json_path TEXT,
-            profile_json TEXT,
-            filing_history_json TEXT,
-            extraction_json TEXT,
-            warnings_json TEXT,
-            model_used TEXT,
-            pdf_size_bytes INTEGER,
-            approx_llm_tokens INTEGER,
-            error_message TEXT,
-            created_at TEXT NOT NULL,
-            FOREIGN KEY(run_id) REFERENCES runs(run_id)
-        )
-        """
-    )
-    cols = {
-        row[1]
-        for row in conn.execute("PRAGMA table_info(company_reports)").fetchall()
-    }
-    if "model_used" not in cols:
-        conn.execute("ALTER TABLE company_reports ADD COLUMN model_used TEXT")
-    if "pdf_size_bytes" not in cols:
-        conn.execute("ALTER TABLE company_reports ADD COLUMN pdf_size_bytes INTEGER")
-    if "approx_llm_tokens" not in cols:
-        conn.execute("ALTER TABLE company_reports ADD COLUMN approx_llm_tokens INTEGER")
-    conn.commit()
-
-
-def _insert_run(
-    conn: sqlite3.Connection,
-    input_xlsx_path: str,
-    output_run_dir: str,
-    model: str,
-    extraction_types: list[ExtractionType],
-) -> int:
-    cursor = conn.execute(
-        """
-        INSERT INTO runs (
-            started_at,
-            input_xlsx_path,
-            output_run_dir,
-            model,
-            extraction_types_json
-        ) VALUES (?, ?, ?, ?, ?)
-        """,
-        (
-            _utc_now(),
-            input_xlsx_path,
-            output_run_dir,
-            model,
-            json.dumps([e.value for e in extraction_types]),
-        ),
-    )
-    conn.commit()
-    return int(cursor.lastrowid)
-
-
-def _finalize_run(
-    conn: sqlite3.Connection,
-    run_id: int,
-    total_companies: int,
-    processed: int,
-    succeeded: int,
-    failed: int,
-) -> None:
-    conn.execute(
-        """
-        UPDATE runs
-        SET
-            finished_at = ?,
-            total_companies = ?,
-            processed = ?,
-            succeeded = ?,
-            failed = ?
-        WHERE run_id = ?
-        """,
-        (_utc_now(), total_companies, processed, succeeded, failed, run_id),
-    )
-    conn.commit()
-
-
-def _insert_company_row(
-    conn: sqlite3.Connection,
-    payload: dict[str, Any],
-) -> None:
-    conn.execute(
-        """
-        INSERT INTO company_reports (
-            run_id,
-            source_row_index,
-            group_uid,
-            group_id,
-            group_name,
-            company_number,
-            company_name,
-            status,
-            document_id,
-            pdf_path,
-            profile_json_path,
-            filing_history_json_path,
-            extraction_json_path,
-            warnings_json_path,
-            profile_json,
-            filing_history_json,
-            extraction_json,
-            warnings_json,
-            model_used,
-            pdf_size_bytes,
-            approx_llm_tokens,
-            error_message,
-            created_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        """,
-        (
-            payload["run_id"],
-            payload["source_row_index"],
-            payload.get("group_uid"),
-            payload.get("group_id"),
-            payload.get("group_name"),
-            payload["company_number"],
-            payload.get("company_name"),
-            payload["status"],
-            payload.get("document_id"),
-            payload.get("pdf_path"),
-            payload.get("profile_json_path"),
-            payload.get("filing_history_json_path"),
-            payload.get("extraction_json_path"),
-            payload.get("warnings_json_path"),
-            payload.get("profile_json"),
-            payload.get("filing_history_json"),
-            payload.get("extraction_json"),
-            payload.get("warnings_json"),
-            payload.get("model_used"),
-            payload.get("pdf_size_bytes"),
-            payload.get("approx_llm_tokens"),
-            payload.get("error_message"),
-            _utc_now(),
-        ),
-    )
-    conn.commit()
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -712,13 +365,13 @@ def main() -> int:
     output_run_dir.mkdir(parents=True, exist_ok=True)
 
     db_path = Path(args.db_path) if args.db_path else output_root / DEFAULT_DB_NAME
-    _ensure_parent(db_path)
+    ensure_parent(db_path)
     conn = sqlite3.connect(db_path)
-    _create_tables(conn)
+    create_tables(conn)
 
-    extraction_types = _extraction_types_for_schema_profile(args.schema_profile, company_type)
+    extraction_types = extraction_types_for_schema_profile(args.schema_profile, company_type)
 
-    run_id = _insert_run(
+    run_id = insert_run(
         conn=conn,
         input_xlsx_path=str(input_xlsx),
         output_run_dir=str(output_run_dir),
@@ -755,15 +408,9 @@ def main() -> int:
         batch = rng.sample(batch, args.random_sample_size)
 
     total_companies = len(batch)
-    model_candidates = [args.model] + _parse_fallback_models(args.fallback_models)
-    deduped_models: list[str] = []
-    seen_models: set[str] = set()
-    for model in model_candidates:
-        if model in seen_models:
-            continue
-        seen_models.add(model)
-        deduped_models.append(model)
-    model_candidates = deduped_models
+    model_candidates = deduplicate_ordered(
+        [args.model] + parse_fallback_models(args.fallback_models)
+    )
 
     print(f"[run {run_id}] companies_to_process={total_companies}")
     print(f"[run {run_id}] models={model_candidates}")
@@ -835,7 +482,7 @@ def main() -> int:
             )
             filing_history = filing_history_page.get("items") or []
             stage = "filing_history_ok"
-            document_id = _latest_full_accounts_document_id_from_filing_history(filing_history)
+            document_id = latest_full_accounts_document_id(filing_history)
             if not document_id:
                 raise ValueError("No full accounts document found")
             stage = "latest_document_ok"
@@ -849,7 +496,7 @@ def main() -> int:
             )
             stage = "download_ok"
             pdf_size_bytes = Path(downloaded_path).stat().st_size
-            approx_llm_tokens = _estimate_llm_tokens_for_pdf_bytes(pdf_size_bytes)
+            approx_llm_tokens = estimate_llm_tokens_for_pdf_bytes(pdf_size_bytes)
             summary_row["pdf_path"] = str(pdf_path)
             summary_row["pdf_size_bytes"] = pdf_size_bytes
             summary_row["approx_llm_tokens"] = approx_llm_tokens
@@ -859,7 +506,7 @@ def main() -> int:
             run_extraction_types = extraction_types
 
             try:
-                extraction_payload, warnings_payload, model_used = _extract_with_model_fallback(
+                extraction_payload, warnings_payload, model_used = extract_with_model_fallback(
                     api_key=openrouter_api_key,
                     model_candidates=model_candidates,
                     document_path=downloaded_path,
@@ -870,14 +517,14 @@ def main() -> int:
             except DocumentExtractionError as exc:
                 if (
                     args.schema_profile == "compact_single_call"
-                    and _is_schema_depth_error(exc)
+                    and is_schema_depth_error(exc)
                 ):
                     had_schema_depth_error = True
                     extraction_schema_profile = "light_core"
-                    run_extraction_types = _extraction_types_for_schema_profile(
+                    run_extraction_types = extraction_types_for_schema_profile(
                         extraction_schema_profile, company_type
                     )
-                    extraction_payload, warnings_payload, model_used = _extract_with_model_fallback(
+                    extraction_payload, warnings_payload, model_used = extract_with_model_fallback(
                         api_key=openrouter_api_key,
                         model_candidates=model_candidates,
                         document_path=downloaded_path,
@@ -894,7 +541,7 @@ def main() -> int:
                 else "annual_report"
             )
             if extraction_payload.get(annual_report_key) is None:
-                derived = _derive_annual_report_from_component_sections(extraction_payload)
+                derived = derive_annual_report_from_component_sections(extraction_payload)
                 if derived is not None:
                     extraction_payload[annual_report_key] = derived
             stage = "extraction_ok"
@@ -931,7 +578,7 @@ def main() -> int:
             write_json(warnings_path, warnings_payload)
             write_json(run_report_path, run_report)
 
-            _insert_company_row(
+            insert_company_row(
                 conn,
                 {
                     "run_id": run_id,
@@ -980,7 +627,7 @@ def main() -> int:
             error_message = "".join(
                 traceback.format_exception(exc.__class__, exc, exc.__traceback__)
             )[:MAX_ERROR_TRACEBACK_CHARS]
-            _insert_company_row(
+            insert_company_row(
                 conn,
                 {
                     "run_id": run_id,
@@ -1017,7 +664,7 @@ def main() -> int:
             print(f"{prefix} failed error={exc}")
         company_summaries.append(summary_row)
 
-    _finalize_run(
+    finalize_run(
         conn=conn,
         run_id=run_id,
         total_companies=total_companies,
@@ -1037,7 +684,7 @@ def main() -> int:
             "run_type": "batch_extract_companies",
             "company_type": company_type.value,
             "run_id": run_id,
-            "timestamp_utc": _utc_now(),
+            "timestamp_utc": utc_now_iso(),
             "input_xlsx_path": str(input_xlsx),
             "output_run_dir": str(output_run_dir),
             "model": args.model,

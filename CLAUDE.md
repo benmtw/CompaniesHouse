@@ -44,11 +44,12 @@ flows/                              # Prefect flows and tasks
         extraction.py               # LLM extraction tasks
         persistence.py              # JSON + SQLite persistence
 prefect.yaml                       # Deployment configuration
+shared.py                          # Shared utilities, DB ops, extraction helpers (used by CLI + flows)
 companies_house_client.py           # HTTP API client (not a Prefect task)
 openrouter_document_extractor.py    # LLM extraction class (not a Prefect task)
 document_extraction_models.py       # Pydantic models for extraction schemas
 company_type.py                     # CompanyType enum (GENERIC, ACADEMY_TRUST)
-batch_extract_companies.py          # Original CLI script (utility functions reused by flows)
+batch_extract_companies.py          # CLI entry point + XLSX reader
 test_companies_house_client.py      # Unit tests (mocked HTTP)
 ```
 

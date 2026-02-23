@@ -42,6 +42,7 @@ Expected usage:
 - `.env`
 - `requirements.txt`
 - `companies_house_client.py`
+- `shared.py`
 - `test_companies_house_client.py`
 - `COMPANIES_HOUSE_API.md`
 - `AGENTS.md`

@@ -10,17 +10,14 @@ from typing import Any
 from prefect import task
 
 from document_extraction_models import ExtractionType
-
-
-DEFAULT_DB_NAME = "companies_house_extractions.db"
-
-
-def _utc_now() -> str:
-    return datetime.now(UTC).replace(microsecond=0).isoformat()
-
-
-def _ensure_parent(path: Path) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
+from shared import (
+    DEFAULT_DB_NAME,
+    create_tables,
+    ensure_parent,
+    finalize_run as _finalize_run_core,
+    insert_run,
+    utc_now_iso,
+)
 
 
 @task(name="load-and-prepare-batch", retries=0)
@@ -67,68 +64,6 @@ def load_and_prepare_batch(
     return batch
 
 
-def _create_tables(conn: sqlite3.Connection) -> None:
-    conn.execute(
-        """
-        CREATE TABLE IF NOT EXISTS runs (
-            run_id INTEGER PRIMARY KEY AUTOINCREMENT,
-            started_at TEXT NOT NULL,
-            finished_at TEXT,
-            input_xlsx_path TEXT NOT NULL,
-            output_run_dir TEXT NOT NULL,
-            model TEXT NOT NULL,
-            extraction_types_json TEXT NOT NULL,
-            total_companies INTEGER NOT NULL DEFAULT 0,
-            processed INTEGER NOT NULL DEFAULT 0,
-            succeeded INTEGER NOT NULL DEFAULT 0,
-            failed INTEGER NOT NULL DEFAULT 0
-        )
-        """
-    )
-    conn.execute(
-        """
-        CREATE TABLE IF NOT EXISTS company_reports (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            run_id INTEGER NOT NULL,
-            source_row_index INTEGER NOT NULL,
-            group_uid TEXT,
-            group_id TEXT,
-            group_name TEXT,
-            company_number TEXT NOT NULL,
-            company_name TEXT,
-            status TEXT NOT NULL,
-            document_id TEXT,
-            pdf_path TEXT,
-            profile_json_path TEXT,
-            filing_history_json_path TEXT,
-            extraction_json_path TEXT,
-            warnings_json_path TEXT,
-            profile_json TEXT,
-            filing_history_json TEXT,
-            extraction_json TEXT,
-            warnings_json TEXT,
-            model_used TEXT,
-            pdf_size_bytes INTEGER,
-            approx_llm_tokens INTEGER,
-            error_message TEXT,
-            created_at TEXT NOT NULL,
-            FOREIGN KEY(run_id) REFERENCES runs(run_id)
-        )
-        """
-    )
-    cols = {
-        row[1]
-        for row in conn.execute("PRAGMA table_info(company_reports)").fetchall()
-    }
-    if "model_used" not in cols:
-        conn.execute("ALTER TABLE company_reports ADD COLUMN model_used TEXT")
-    if "pdf_size_bytes" not in cols:
-        conn.execute("ALTER TABLE company_reports ADD COLUMN pdf_size_bytes INTEGER")
-    if "approx_llm_tokens" not in cols:
-        conn.execute("ALTER TABLE company_reports ADD COLUMN approx_llm_tokens INTEGER")
-    conn.commit()
-
-
 @task(name="initialize-run", retries=0)
 def initialize_run(
     input_xlsx_path: str,
@@ -147,32 +82,19 @@ def initialize_run(
     output_run_dir.mkdir(parents=True, exist_ok=True)
 
     resolved_db_path = Path(db_path) if db_path else output_root_path / DEFAULT_DB_NAME
-    _ensure_parent(resolved_db_path)
+    ensure_parent(resolved_db_path)
     conn = sqlite3.connect(resolved_db_path, timeout=10)
     conn.execute("PRAGMA journal_mode=WAL")
     conn.execute("PRAGMA busy_timeout=5000")
-    _create_tables(conn)
+    create_tables(conn)
 
-    cursor = conn.execute(
-        """
-        INSERT INTO runs (
-            started_at,
-            input_xlsx_path,
-            output_run_dir,
-            model,
-            extraction_types_json
-        ) VALUES (?, ?, ?, ?, ?)
-        """,
-        (
-            _utc_now(),
-            input_xlsx_path,
-            str(output_run_dir),
-            model,
-            json.dumps([e.value for e in extraction_types]),
-        ),
+    run_id = insert_run(
+        conn=conn,
+        input_xlsx_path=input_xlsx_path,
+        output_run_dir=str(output_run_dir),
+        model=model,
+        extraction_types=extraction_types,
     )
-    conn.commit()
-    run_id = int(cursor.lastrowid)
     conn.close()
 
     return {
@@ -193,18 +115,12 @@ def finalize_run(
 ) -> None:
     """Update run totals and mark as finished."""
     conn = sqlite3.connect(db_path)
-    conn.execute(
-        """
-        UPDATE runs
-        SET
-            finished_at = ?,
-            total_companies = ?,
-            processed = ?,
-            succeeded = ?,
-            failed = ?
-        WHERE run_id = ?
-        """,
-        (_utc_now(), total_companies, processed, succeeded, failed, run_id),
+    _finalize_run_core(
+        conn=conn,
+        run_id=run_id,
+        total_companies=total_companies,
+        processed=processed,
+        succeeded=succeeded,
+        failed=failed,
     )
-    conn.commit()
     conn.close()
