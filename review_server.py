@@ -214,8 +214,20 @@ def company_detail(report_id):
         row = db.execute("SELECT * FROM company_reports WHERE id = ?", (report_id,)).fetchone()
         if not row:
             abort(404, "Report not found")
+        # Previous/next within the same run
+        prev_row = db.execute(
+            "SELECT id FROM company_reports WHERE run_id = ? AND id < ? ORDER BY id DESC LIMIT 1",
+            (row["run_id"], report_id),
+        ).fetchone()
+        next_row = db.execute(
+            "SELECT id FROM company_reports WHERE run_id = ? AND id > ? ORDER BY id ASC LIMIT 1",
+            (row["run_id"], report_id),
+        ).fetchone()
     finally:
         db.close()
+
+    prev_id = prev_row["id"] if prev_row else None
+    next_id = next_row["id"] if next_row else None
 
     company_number = row["company_number"]
     company_name = row["company_name"] or company_number
@@ -252,6 +264,11 @@ def company_detail(report_id):
 <nav>
   <a href="/">&larr; All Runs</a>
   <a href="/run/{row['run_id']}">&larr; Run {row['run_id']}</a>
+  <span style="float:right;">
+    {'<a href="/company/' + str(prev_id) + '">&larr; Prev</a>' if prev_id else '<span style="color:#aaa">&larr; Prev</span>'}
+    &nbsp;|&nbsp;
+    {'<a href="/company/' + str(next_id) + '">Next &rarr;</a>' if next_id else '<span style="color:#aaa">Next &rarr;</span>'}
+  </span>
 </nav>
 <h2>{company_name} <small>({company_number})</small></h2>
 <p class="meta">
