@@ -138,6 +138,93 @@ class CompaniesHouseClient:
         url = f"{self.public_base_url}/company/{company_number}"
         return self._request_json("GET", url)
 
+    def get_current_officers(
+        self,
+        company_number: str,
+        items_per_page: int = 100,
+        start_index: int = 0,
+    ) -> list[dict[str, Any]]:
+        """
+        Fetch all current (not resigned) officers for a company.
+
+        Returns a list of dicts with keys: first_name, last_name, role,
+        correspondence_address, date_of_birth, appointed_on.
+        Paginates automatically to collect all results.
+        """
+        self._require_non_empty(company_number, "company_number")
+        self._require_non_negative(items_per_page, "items_per_page")
+        self._require_non_negative(start_index, "start_index")
+        if items_per_page == 0:
+            raise ValueError("items_per_page must be > 0")
+
+        all_officers: list[dict[str, Any]] = []
+        total_count = None
+
+        while total_count is None or start_index < total_count:
+            params: dict[str, Any] = {
+                "items_per_page": items_per_page,
+                "start_index": start_index,
+            }
+            url = f"{self.public_base_url}/company/{company_number}/officers"
+            page = self._request_json("GET", url, params=params)
+            total_count = int(page.get("total_results", 0))
+            items = page.get("items", []) or []
+            if not items:
+                break
+
+            for item in items:
+                if item.get("resigned_on"):
+                    continue
+                all_officers.append(self._normalize_officer(item))
+
+            start_index += items_per_page
+
+        return all_officers
+
+    @staticmethod
+    def _normalize_officer(item: dict[str, Any]) -> dict[str, Any]:
+        """Extract the requested fields from a raw officers API item."""
+        name_elements = item.get("name_elements") or {}
+        first_name = (
+            name_elements.get("forename") or item.get("forename") or ""
+        ).strip()
+        middle_names = (
+            name_elements.get("other_forenames")
+            or item.get("other_forenames")
+            or ""
+        ).strip()
+        last_name = (
+            name_elements.get("surname") or item.get("surname") or ""
+        ).strip()
+
+        # Fallback: parse the combined "name" field (format: "SURNAME, Forename Middle")
+        if not last_name and not first_name:
+            full_name = (item.get("name") or "").strip()
+            if "," in full_name:
+                parts = full_name.split(",", 1)
+                last_name = parts[0].strip()
+                given_parts = parts[1].strip().split(None, 1)
+                first_name = given_parts[0] if given_parts else ""
+                if not middle_names and len(given_parts) > 1:
+                    middle_names = given_parts[1]
+            else:
+                last_name = full_name
+
+        dob = item.get("date_of_birth") or {}
+
+        return {
+            "first_name": first_name,
+            "middle_names": middle_names,
+            "last_name": last_name,
+            "role": (item.get("officer_role") or "").strip(),
+            "appointed_on": (item.get("appointed_on") or "").strip(),
+            "date_of_birth": {
+                "month": dob.get("month"),
+                "year": dob.get("year"),
+            } if dob else None,
+            "correspondence_address": item.get("address") or {},
+        }
+
     def get_filing_history(
         self,
         company_number: str,

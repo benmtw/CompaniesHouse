@@ -5,7 +5,9 @@ Batch processes UK company filings from XLSX input, downloads PDFs via the [Comp
 ## Features
 
 - **Batch processing** -- reads company numbers from XLSX spreadsheets and processes them in parallel
-- **Companies House API client** -- fetches company profiles, filing histories, and downloads filing documents (PDFs)
+- **Companies House API client** -- fetches company profiles, filing histories, officers, and downloads filing documents (PDFs)
+- **Two modes**: `extract` (LLM-powered document extraction) and `personnel` (current officers lookup, no LLM needed)
+- **Personnel caching** -- officer lookups are cached with configurable TTL (default 7 days) to minimise API calls
 - **LLM-powered extraction** -- sends downloaded PDFs to OpenRouter for structured data extraction (personnel, financials, governance, staffing)
 - **Academy Trust (MAT) support** -- specialised extraction for Multi-Academy Trust annual reports (SOFA, balance sheets, fund breakdowns)
 - **Prefect orchestration** -- concurrent company processing, rate limiting, secret management, and failure hooks
@@ -27,29 +29,60 @@ pip install git+https://github.com/benmtw/CompaniesHouse.git@v0.1.0
 pip install git+https://github.com/benmtw/CompaniesHouse.git@abc1234
 ```
 
-If the repository is **private**, use SSH instead:
+### Private repo authentication
+
+This is a private repository. You need to authenticate with GitHub to install it.
+
+**Option A -- Personal Access Token (PAT) via HTTPS (recommended)**
+
+1. Create a GitHub Personal Access Token at https://github.com/settings/tokens with `repo` scope.
+2. Configure git to use the token so pip can clone the repo:
+
+```bash
+git config --global url."https://<YOUR_GITHUB_TOKEN>@github.com/".insteadOf "https://github.com/"
+```
+
+Then install normally:
+
+```bash
+pip install git+https://github.com/benmtw/CompaniesHouse.git
+```
+
+Alternatively, embed the token directly in the URL (useful for CI/Docker):
+
+```bash
+pip install git+https://<YOUR_GITHUB_TOKEN>@github.com/benmtw/CompaniesHouse.git
+```
+
+**Option B -- SSH**
+
+If you have an SSH key registered with GitHub:
 
 ```bash
 pip install git+ssh://git@github.com/benmtw/CompaniesHouse.git
 ```
 
-You can also add it to your project's `requirements.txt`:
+### Adding to your project's dependencies
+
+In `requirements.txt`:
 
 ```
-# HTTPS (public or with token)
+# HTTPS (token must be configured via git config or environment)
 companies-house-extraction @ git+https://github.com/benmtw/CompaniesHouse.git
 
-# SSH (private repo)
+# SSH
 companies-house-extraction @ git+ssh://git@github.com/benmtw/CompaniesHouse.git
 ```
 
-Or in `pyproject.toml` dependencies:
+Or in `pyproject.toml`:
 
 ```toml
 dependencies = [
     "companies-house-extraction @ git+https://github.com/benmtw/CompaniesHouse.git",
 ]
 ```
+
+> **Note:** Never commit a token directly in `requirements.txt` or `pyproject.toml`. Use `git config --global url...insteadOf` or set the `GIT_AUTH_TOKEN` environment variable in your CI pipeline instead.
 
 ## Quick Start
 
@@ -70,8 +103,8 @@ Copy `.env.example` to `.env` and fill in your API keys:
 
 ```
 CH_API_KEY=your_companies_house_api_key
-OPENROUTER_API_KEY=your_openrouter_api_key
-OPENROUTER_MODEL=google/gemini-2.5-flash-lite
+OPENROUTER_API_KEY=your_openrouter_api_key      # Only needed for extract mode
+OPENROUTER_MODEL=google/gemini-2.5-flash-lite   # Only needed for extract mode
 ```
 
 Get a Companies House API key at https://developer.company-information.service.gov.uk/.
@@ -80,11 +113,24 @@ Get a Companies House API key at https://developer.company-information.service.g
 
 ### 3. Run the CLI
 
+**Extract mode** (document extraction with LLM):
+
 ```bash
 python batch_extract_companies.py \
+  --mode extract \
   --input-xlsx "SourceData/Trusts.xlsx" \
   --output-root "output/trusts_extraction" \
   --model "google/gemini-2.5-flash-lite" \
+  --max-companies 5
+```
+
+**Personnel mode** (officers only, no LLM needed):
+
+```bash
+python batch_extract_companies.py \
+  --mode personnel \
+  --input-xlsx "SourceData/Trusts.xlsx" \
+  --output-root "output/personnel" \
   --max-companies 5
 ```
 
@@ -104,9 +150,10 @@ See [docs/Prefect.md](docs/Prefect.md) for full setup, deployment, and monitorin
 
 | Flag | Description |
 |------|-------------|
+| `--mode` | `extract` (default) or `personnel` -- see [Modes](#modes) below |
 | `--input-xlsx` | Path to XLSX file with company numbers |
 | `--output-root` | Root directory for output files |
-| `--model` | OpenRouter model to use |
+| `--model` | OpenRouter model to use (extract mode only) |
 | `--max-companies N` | Limit to first N companies |
 | `--start-index N` | Resume from offset in the company list |
 | `--random-sample-size N` | Process a random sample |
@@ -115,8 +162,51 @@ See [docs/Prefect.md](docs/Prefect.md) for full setup, deployment, and monitorin
 | `--schema-profile` | `compact_single_call` (default), `full_legacy`, or `light_core` |
 | `--write-summary-json` | Emit run-level summary.json |
 | `--retries-on-invalid-json N` | Retries on malformed LLM JSON (default 3) |
+| `--personnel-cache-dir` | Cache directory for personnel lookups (default: `output/personnel_cache`) |
+| `--personnel-cache-ttl-days` | Days before cached personnel is stale (default: 7, set 0 to disable) |
+
+## Modes
+
+### Extract Mode (default)
+
+Downloads filing documents (PDFs) from Companies House and runs LLM-powered extraction via OpenRouter. Requires `CH_API_KEY`, `OPENROUTER_API_KEY`, and `OPENROUTER_MODEL`.
+
+```bash
+python batch_extract_companies.py \
+  --mode extract \
+  --input-xlsx "SourceData/Trusts.xlsx" \
+  --output-root "output/trusts_extraction" \
+  --model "google/gemini-2.5-flash-lite" \
+  --max-companies 5
+```
+
+### Personnel Mode
+
+Fetches current company officers (directors, secretaries, etc.) directly from the Companies House API. **No OpenRouter credentials required** -- only `CH_API_KEY`.
+
+Officers are cached locally to avoid repeated API calls. The cache stores each company's officers with a timestamp, and respects a configurable TTL (default 7 days). Since officer data can change over time (unlike historical documents), the cache expires automatically.
+
+```bash
+python batch_extract_companies.py \
+  --mode personnel \
+  --input-xlsx "SourceData/Trusts.xlsx" \
+  --output-root "output/personnel" \
+  --personnel-cache-ttl-days 7 \
+  --max-companies 5
+```
+
+**Personnel mode options:**
+
+| Flag | Description |
+|------|-------------|
+| `--personnel-cache-dir` | Directory for cached officer data (default: `output/personnel_cache`) |
+| `--personnel-cache-ttl-days` | Cache expiry in days. Set to `0` to disable caching and always hit the API |
+
+Each officer record contains: `first_name`, `middle_names`, `last_name`, `role`, `appointed_on`, `date_of_birth` (month/year only -- API restriction), and `correspondence_address`.
 
 ## Output
+
+### Extract Mode
 
 Each run creates a timestamped directory under `--output-root`:
 
@@ -130,6 +220,20 @@ output/trusts_extraction/run_<UTCSTAMP>/
 ```
 
 Results are also persisted to SQLite (`companies_house_extractions.db`).
+
+### Personnel Mode
+
+```
+output/personnel/run_<UTCSTAMP>/
+  <company_number>/
+    officers.json       # Current officers for this company
+  personnel_summary.json  # Run summary with cache stats
+
+output/personnel_cache/
+  <company_number>.json  # Cached officer data with fetched_at timestamp
+```
+
+The `personnel_summary.json` includes `cache_hits` and `api_calls` counts so you can see how many companies were served from cache vs fresh API lookups.
 
 ## Testing
 

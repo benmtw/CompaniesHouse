@@ -229,6 +229,15 @@ def build_parser() -> argparse.ArgumentParser:
         help="Path to input XLSX file containing company numbers",
     )
     parser.add_argument(
+        "--mode",
+        choices=["extract", "personnel"],
+        default="extract",
+        help=(
+            "Pipeline mode. 'extract' (default) downloads filings and runs LLM extraction. "
+            "'personnel' fetches current officers from the Companies House API only (no OpenRouter needed)."
+        ),
+    )
+    parser.add_argument(
         "--company-type",
         choices=[ct.value for ct in CompanyType],
         default=CompanyType.GENERIC.value,
@@ -325,11 +334,180 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--personnel-cache-dir",
+        default="output/personnel_cache",
+        help="Directory for cached personnel lookups (default: %(default)s)",
+    )
+    parser.add_argument(
+        "--personnel-cache-ttl-days",
+        type=float,
+        default=7.0,
+        help="Days before a cached personnel lookup is considered stale (default: %(default)s, 0 to disable cache)",
+    )
+    parser.add_argument(
         "--use-prefect",
         action="store_true",
         help="Run as a Prefect flow instead of the legacy sequential script",
     )
     return parser
+
+
+def _read_personnel_cache(
+    cache_dir: Path, company_number: str, ttl_days: float
+) -> list[dict[str, Any]] | None:
+    """Return cached officers list if the cache file exists and is within TTL, else None."""
+    if ttl_days <= 0:
+        return None
+    cache_file = cache_dir / f"{company_number}.json"
+    if not cache_file.is_file():
+        return None
+    try:
+        data = json.loads(cache_file.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError):
+        return None
+    fetched_at = data.get("fetched_at")
+    if not fetched_at:
+        return None
+    try:
+        fetched_dt = datetime.fromisoformat(fetched_at)
+    except ValueError:
+        return None
+    age_days = (datetime.now(UTC) - fetched_dt).total_seconds() / 86400
+    if age_days > ttl_days:
+        return None
+    return data.get("officers")
+
+
+def _write_personnel_cache(
+    cache_dir: Path, company_number: str, officers: list[dict[str, Any]]
+) -> None:
+    """Write officers list to the cache directory with a fetched_at timestamp."""
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    cache_file = cache_dir / f"{company_number}.json"
+    payload = {
+        "company_number": company_number,
+        "fetched_at": datetime.now(UTC).isoformat(),
+        "officers": officers,
+    }
+    write_json(cache_file, payload)
+
+
+def _run_personnel_mode(args: argparse.Namespace, input_xlsx: Path, ch_api_key: str) -> int:
+    """Fetch current officers for each company and write JSON output. No OpenRouter needed."""
+    if args.ch_min_request_interval_seconds < 0:
+        raise ValueError("ch_min_request_interval_seconds must be >= 0")
+
+    cache_dir = Path(args.personnel_cache_dir)
+    ttl_days = args.personnel_cache_ttl_days
+
+    output_root = Path(args.output_root)
+    run_stamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
+    output_run_dir = output_root / f"run_{run_stamp}"
+    output_run_dir.mkdir(parents=True, exist_ok=True)
+
+    rows = read_xlsx_rows(input_xlsx)
+    seen: set[str] = set()
+    batch: list[dict[str, Any]] = []
+    for source_index, row in enumerate(rows, start=2):
+        normalized = normalize_company_number(row.get("Companies House Number", ""))
+        if not normalized or normalized in seen:
+            continue
+        seen.add(normalized)
+        batch.append({
+            "source_row_index": source_index,
+            "group_uid": row.get("Group UID"),
+            "group_id": row.get("Group ID"),
+            "group_name": row.get("Group Name"),
+            "company_number": normalized,
+        })
+
+    if args.start_index > 0:
+        batch = batch[args.start_index:]
+    if args.max_companies > 0:
+        batch = batch[:args.max_companies]
+    if args.random_sample_size > 0 and len(batch) > args.random_sample_size:
+        rng = random.Random(None if args.random_seed == 0 else args.random_seed)
+        batch = rng.sample(batch, args.random_sample_size)
+
+    total = len(batch)
+    client = CompaniesHouseClient(api_key=ch_api_key)
+    _install_companies_house_request_throttle(
+        client=client,
+        min_interval_seconds=args.ch_min_request_interval_seconds,
+    )
+
+    print(f"[personnel] output_dir={output_run_dir}")
+    print(f"[personnel] cache_dir={cache_dir}")
+    print(f"[personnel] cache_ttl_days={ttl_days}")
+    print(f"[personnel] companies_to_process={total}")
+
+    succeeded = 0
+    failed = 0
+    cache_hits = 0
+    all_results: list[dict[str, Any]] = []
+
+    for idx, item in enumerate(batch, start=1):
+        company_number = item["company_number"]
+        prefix = f"[personnel] [{idx}/{total}] {company_number}"
+        try:
+            cached = _read_personnel_cache(cache_dir, company_number, ttl_days)
+            if cached is not None:
+                officers = cached
+                source = "cache"
+                cache_hits += 1
+            else:
+                officers = client.get_current_officers(company_number)
+                _write_personnel_cache(cache_dir, company_number, officers)
+                source = "api"
+
+            result = {
+                "company_number": company_number,
+                "group_uid": item.get("group_uid"),
+                "group_id": item.get("group_id"),
+                "group_name": item.get("group_name"),
+                "status": "success",
+                "source": source,
+                "officers": officers,
+            }
+            company_dir = output_run_dir / company_number
+            company_dir.mkdir(parents=True, exist_ok=True)
+            officers_path = company_dir / "officers.json"
+            write_json(officers_path, officers)
+            succeeded += 1
+            print(f"{prefix} success officers={len(officers)} source={source}")
+        except Exception as exc:
+            result = {
+                "company_number": company_number,
+                "group_uid": item.get("group_uid"),
+                "group_id": item.get("group_id"),
+                "group_name": item.get("group_name"),
+                "status": "failed",
+                "officers": [],
+                "error": str(exc),
+            }
+            failed += 1
+            print(f"{prefix} failed error={exc}")
+        all_results.append(result)
+
+    summary_path = output_run_dir / "personnel_summary.json"
+    write_json(summary_path, {
+        "run_type": "personnel",
+        "timestamp_utc": utc_now_iso(),
+        "input_xlsx_path": str(input_xlsx),
+        "output_run_dir": str(output_run_dir),
+        "cache_dir": str(cache_dir),
+        "cache_ttl_days": ttl_days,
+        "total_companies": total,
+        "succeeded": succeeded,
+        "failed": failed,
+        "cache_hits": cache_hits,
+        "api_calls": succeeded - cache_hits,
+        "companies": all_results,
+    })
+
+    print(f"[personnel] complete processed={total} succeeded={succeeded} failed={failed} cache_hits={cache_hits}")
+    print(f"[personnel] summary={summary_path}")
+    return 0
 
 
 def main() -> int:
@@ -343,6 +521,10 @@ def main() -> int:
     ch_api_key = os.getenv("CH_API_KEY")
     if not ch_api_key:
         raise ValueError("Missing CH_API_KEY. Set in environment or .env.")
+
+    if args.mode == "personnel":
+        return _run_personnel_mode(args, input_xlsx, ch_api_key)
+
     openrouter_api_key = os.getenv("OPENROUTER_API_KEY")
     if not openrouter_api_key:
         raise ValueError("Missing OPENROUTER_API_KEY. Set in environment or .env.")

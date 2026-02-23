@@ -462,6 +462,11 @@ def _build_parser() -> argparse.ArgumentParser:
         default="all",
         help="Pipeline mode: all, download-only, or extract-only",
     )
+    parser.add_argument(
+        "--cache-dir",
+        default=DEFAULT_CH_CACHE_DIR,
+        help="Directory for cached Companies House document downloads (default: %(default)s)",
+    )
     parser.add_argument("--ch-workers", type=int, default=DEFAULT_CH_WORKERS)
     parser.add_argument("--or-workers", type=int, default=DEFAULT_OR_WORKERS)
     parser.add_argument(
@@ -836,7 +841,7 @@ def _extract_stage_worker_loop(
             seen_models.add(model)
 
     extraction_types = extraction_types_for_schema_profile(args.schema_profile)
-    cache_dir = Path(DEFAULT_CH_CACHE_DIR)
+    cache_dir = Path(args.cache_dir)
 
     ch_client: CompaniesHouseClient | None = None
     if ch_api_key:
