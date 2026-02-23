@@ -104,12 +104,16 @@ def is_schema_depth_error(exc: Exception) -> bool:
 
 
 def is_full_accounts_filing(item: dict[str, Any]) -> bool:
-    """Return True if a filing-history item represents full accounts."""
+    """Return True if a filing-history item represents full accounts or group accounts."""
     filing_type = str(item.get("type") or "").upper()
     description = str(item.get("description") or "").lower()
     if filing_type != "AA":
         return False
-    return "accounts-with-accounts-type-full" in description or "full" in description
+    return (
+        "accounts-with-accounts-type-full" in description
+        or "full" in description
+        or "group of companies" in description
+    )
 
 
 def latest_full_accounts_document_id(
@@ -368,6 +372,37 @@ def finalize_run(
         (utc_now_iso(), total_companies, processed, succeeded, failed, run_id),
     )
     conn.commit()
+
+
+def get_cached_extraction(db_path: str, document_id: str) -> dict[str, Any] | None:
+    """Look up a cached extraction result by document_id.
+
+    Returns the most recent successful extraction for this document, or None.
+    The returned dict contains: extraction_payload, warnings, model_used.
+    """
+    conn = sqlite3.connect(db_path, timeout=10)
+    try:
+        cursor = conn.execute(
+            """
+            SELECT extraction_json, warnings_json, model_used
+            FROM company_reports
+            WHERE document_id = ? AND status = 'success' AND extraction_json IS NOT NULL
+            ORDER BY created_at DESC
+            LIMIT 1
+            """,
+            (document_id,),
+        )
+        row = cursor.fetchone()
+        if row is None:
+            return None
+        extraction_json_str, warnings_json_str, model_used = row
+        return {
+            "extraction_payload": json.loads(extraction_json_str) if extraction_json_str else {},
+            "warnings": json.loads(warnings_json_str) if warnings_json_str else [],
+            "model_used": model_used,
+        }
+    finally:
+        conn.close()
 
 
 def insert_company_row(
