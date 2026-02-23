@@ -95,6 +95,9 @@ def enrich_personnel_names(
         last_name = (person.get("last_name") or "").strip()
         job_title = (person.get("job_title") or "").strip()
 
+        # Preserve the original LLM-extracted name
+        person["first_name_extracted"] = first_name
+
         try:
             result = predict(
                 company_name=company_name,
@@ -114,7 +117,10 @@ def enrich_personnel_names(
                     full_first,
                     last_name,
                 )
+                person["first_name_enriched"] = full_first
                 person["first_name"] = full_first
+            else:
+                person["first_name_enriched"] = None
 
             if email.upper() != "UNKNOWN":
                 person["email"] = email
@@ -128,5 +134,6 @@ def enrich_personnel_names(
                 last_name,
                 exc_info=True,
             )
+            person["first_name_enriched"] = None
 
     return personnel

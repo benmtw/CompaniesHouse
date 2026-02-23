@@ -64,6 +64,8 @@ class PersonnelDetail(BaseModel):
     model_config = ConfigDict(extra="ignore")
 
     first_name: str
+    first_name_extracted: str | None = None
+    first_name_enriched: str | None = None
     last_name: str
     job_title: str
     organisation_name: str | None = None

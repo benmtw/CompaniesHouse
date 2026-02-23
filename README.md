@@ -105,9 +105,11 @@ Copy `.env.example` to `.env` and fill in your API keys:
 CH_API_KEY=your_companies_house_api_key
 OPENROUTER_API_KEY=your_openrouter_api_key      # Only needed for extract mode
 OPENROUTER_MODEL=google/gemini-2.5-flash-lite   # Only needed for extract mode
+GEMINI_API_KEY=your_gemini_api_key              # Only needed for name enrichment
 ```
 
 Get a Companies House API key at https://developer.company-information.service.gov.uk/.
+Get a Gemini API key at https://aistudio.google.com/apikey.
 
 > **Cost warning:** avoid setting `OPENROUTER_MODEL=openrouter/auto` as it can route to expensive models. Set an explicit model.
 
@@ -160,6 +162,7 @@ See [docs/Prefect.md](docs/Prefect.md) for full setup, deployment, and monitorin
 | `--random-seed N` | Reproducible random sampling |
 | `--fallback-models "a,b"` | Comma-separated fallback model list |
 | `--schema-profile` | `compact_single_call` (default), `full_legacy`, or `light_core` |
+| `--no-name-enrichment` | Disable Gemini-based name enrichment (see [Name Enrichment](#name-enrichment)) |
 | `--write-summary-json` | Emit run-level summary.json |
 | `--retries-on-invalid-json N` | Retries on malformed LLM JSON (default 3) |
 | `--personnel-cache-dir` | Cache directory for personnel lookups (default: `output/personnel_cache`) |
@@ -235,6 +238,41 @@ output/personnel_cache/
 
 The `personnel_summary.json` includes `cache_hits` and `api_calls` counts so you can see how many companies were served from cache vs fresh API lookups.
 
+## Name Enrichment
+
+After LLM extraction, some trust-level personnel names may be incomplete -- e.g. a first name of "J" or "T." instead of "James" or "Tim". The name enrichment step uses Google Gemini with grounded search (via [DSPy](https://dspy.ai/)) to resolve full first names and optionally find email addresses.
+
+### How it works
+
+- Only trust-level personnel (`organisation_type == "trust"`) with short/initial first names (1-2 characters after stripping periods) are enriched
+- School-level personnel and those with complete names are left unchanged
+- Each incomplete name is queried via `gemini/gemini-flash-lite-latest` with Google Search grounding
+- Enrichment is **enabled by default** in extract mode; disable with `--no-name-enrichment`
+- If `GEMINI_API_KEY` is not set, enrichment is silently skipped with a warning
+
+### Gemini API key and tier requirements
+
+Name enrichment requires a **Google Gemini API key** set as `GEMINI_API_KEY` in `.env`.
+
+> **Paid tier strongly recommended.** The free tier is limited to 15 requests per minute (RPM) and 1,000 requests per day (RPD) for flash-lite models. A typical batch of 50 companies can have 100-200 names to enrich, which would take ~13 minutes on the free tier due to throttling. On a paid tier (Tier 1+), the limit jumps to 2,000 RPM and 14,400 RPD, allowing the same batch to complete in seconds.
+
+| Tier | RPM | RPD | TPM |
+|------|-----|-----|-----|
+| Free | 15 | 1,000 | 250,000 |
+| Tier 1 (paid) | 2,000 | 14,400 | 4,000,000 |
+
+Check your tier by reviewing your project at https://aistudio.google.com/ or by observing whether rapid sequential requests trigger 429 errors.
+
+### Example
+
+```bash
+# With enrichment (default)
+python batch_extract_companies.py --mode extract --max-companies 5
+
+# Without enrichment
+python batch_extract_companies.py --mode extract --max-companies 5 --no-name-enrichment
+```
+
 ## Testing
 
 ```bash
@@ -252,6 +290,7 @@ openrouter_document_extractor.py    # LLM extraction via OpenRouter
 document_extraction_models.py       # Pydantic models for extraction schemas
 company_type.py                     # CompanyType enum (GENERIC, ACADEMY_TRUST)
 shared.py                           # Shared utilities and DB operations
+name_enrichment.py                  # Gemini-based name enrichment for trust personnel
 test_companies_house_client.py      # Unit tests
 
 flows/                              # Prefect workflows
@@ -279,6 +318,7 @@ docs/                               # Documentation
 - [pydantic](https://docs.pydantic.dev/) -- Data validation and extraction models
 - [json-repair](https://github.com/mangiucugna/json_repair) -- Fallback JSON parsing for malformed LLM output
 - [prefect](https://docs.prefect.io/) -- Workflow orchestration (3.x)
+- [dspy](https://dspy.ai/) -- Declarative LLM programming for name enrichment
 
 ## License
 
