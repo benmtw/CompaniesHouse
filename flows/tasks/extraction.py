@@ -9,6 +9,7 @@ from companies_house_client import CompaniesHouseClient
 from company_type import CompanyType
 from document_extraction_models import ExtractionType
 from openrouter_document_extractor import DocumentExtractionError
+from name_enrichment import enrich_personnel_names
 from shared import (
     extract_with_model_fallback,
     extraction_types_for_schema_profile,
@@ -47,6 +48,8 @@ def extract_document(
     retries_on_invalid_json: int = 2,
     schema_profile: str = "compact_single_call",
     company_type: CompanyType = CompanyType.GENERIC,
+    enrich_names: bool = True,
+    company_name: str = "",
 ) -> tuple[dict, list[str], str, bool]:
     """Run LLM extraction with caching and model fallback + schema fallback.
 
@@ -73,7 +76,6 @@ def extract_document(
             retries_on_invalid_json=retries_on_invalid_json,
             company_type=company_type,
         )
-        return payload, warnings, model_used, False  # cache_hit
     except DocumentExtractionError as exc:
         if schema_profile == "compact_single_call" and is_schema_depth_error(exc):
             fallback_types = extraction_types_for_schema_profile(
@@ -87,5 +89,15 @@ def extract_document(
                 retries_on_invalid_json=retries_on_invalid_json,
                 company_type=company_type,
             )
-            return payload, warnings, model_used, False  # cache_hit
-        raise
+        else:
+            raise
+
+    if enrich_names and company_name:
+        pd_list = payload.get("personnel_details")
+        if pd_list:
+            payload["personnel_details"] = enrich_personnel_names(
+                personnel=pd_list,
+                company_name=company_name,
+            )
+
+    return payload, warnings, model_used, False  # cache_hit

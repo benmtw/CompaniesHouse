@@ -17,6 +17,7 @@ from zipfile import ZipFile
 
 from companies_house_client import CompaniesHouseClient
 from company_type import CompanyType
+from name_enrichment import enrich_personnel_names
 from openrouter_document_extractor import DocumentExtractionError
 from shared import (
     DEFAULT_DB_NAME,
@@ -357,6 +358,11 @@ def build_parser() -> argparse.ArgumentParser:
         type=int,
         default=5,
         help="Number of concurrent LLM extraction threads (default: 5)",
+    )
+    parser.add_argument(
+        "--no-name-enrichment",
+        action="store_true",
+        help="Disable Gemini-based name enrichment for incomplete trust personnel names",
     )
     parser.add_argument(
         "--use-prefect",
@@ -859,6 +865,15 @@ def main() -> int:
                 )
                 if derived is not None:
                     extraction_payload[annual_report_key] = derived
+
+            if not args.no_name_enrichment:
+                pd_list = extraction_payload.get("personnel_details")
+                if pd_list:
+                    extraction_payload["personnel_details"] = enrich_personnel_names(
+                        personnel=pd_list,
+                        company_name=profile.get("company_name", ""),
+                    )
+
             stage = "extraction_ok"
 
             profile_path = api_dir / "profile.json"

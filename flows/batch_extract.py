@@ -113,6 +113,7 @@ def process_company_flow(
         retries_on_invalid_json=retries_on_invalid_json,
         schema_profile=schema_profile,
         company_type=company_type,
+        company_name=profile.get("company_name", ""),
     )
 
     annual_report_key = (

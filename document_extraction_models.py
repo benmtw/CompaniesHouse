@@ -69,6 +69,7 @@ class PersonnelDetail(BaseModel):
     organisation_name: str | None = None
     organisation_type: str | None = None
     standardised_job_title: str | None = None
+    email: str | None = None
 
     @field_validator("first_name", "last_name", "job_title")
     @classmethod
