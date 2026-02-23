@@ -162,12 +162,20 @@ def normalize_company_number(raw_value: str) -> str | None:
         return None
     if text.endswith(".0"):
         text = text[:-2]
-    digits = "".join(ch for ch in text if ch.isdigit())
-    if not digits:
+    alnum = "".join(ch for ch in text.upper() if ch.isalnum())
+    if not alnum:
         return None
-    if len(digits) > 8:
+
+    # Prefix-based company numbers such as SC123456 and NI123456 are valid and
+    # must be preserved. We only left-pad when the input is purely numeric.
+    if alnum.isdigit():
+        if len(alnum) > 8:
+            return None
+        return alnum.zfill(8)
+
+    if len(alnum) > 8:
         return None
-    return digits.zfill(8)
+    return alnum
 
 
 def _ensure_parent(path: Path) -> None:
