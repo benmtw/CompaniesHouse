@@ -9,8 +9,12 @@ from urllib.parse import urlparse
 import requests
 from document_extraction_models import (
     AcademyTrustAnnualReport,
+    AnnualReport,
     BalanceSheetEntry,
+    CompanyGovernance,
+    CompanyMetadata,
     DetailedBalanceSheet,
+    DirectorAttendance,
     ExtractionResult,
     ExtractionType,
     Governance,
@@ -526,10 +530,14 @@ class CompaniesHouseClient:
 
 __all__ = [
     "AcademyTrustAnnualReport",
+    "AnnualReport",
     "BalanceSheetEntry",
     "CompaniesHouseApiError",
     "CompaniesHouseClient",
+    "CompanyGovernance",
+    "CompanyMetadata",
     "DetailedBalanceSheet",
+    "DirectorAttendance",
     "DocumentExtractionError",
     "ExtractionResult",
     "ExtractionType",

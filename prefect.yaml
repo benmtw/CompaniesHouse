@@ -1,0 +1,24 @@
+deployments:
+  - name: batch-extract-trusts
+    entrypoint: flows/batch_extract.py:batch_extract_companies_flow
+    work_pool:
+      name: default
+    parameters:
+      input_xlsx: "SourceData/allgroupslinksdata20260217/Trusts.xlsx"
+      output_root: "output/companies_extraction"
+      schema_profile: "compact_single_call"
+      company_type: "academy_trust"
+    schedules:
+      - cron: "0 6 * * 1"
+
+  - name: batch-extract-companies
+    entrypoint: flows/batch_extract.py:batch_extract_companies_flow
+    work_pool:
+      name: default
+    parameters:
+      input_xlsx: "SourceData/companies.xlsx"
+      output_root: "output/companies_extraction"
+      schema_profile: "compact_single_call"
+      company_type: "generic"
+    schedules:
+      - cron: "0 8 * * 1"

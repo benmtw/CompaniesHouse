@@ -6,9 +6,13 @@ from unittest.mock import Mock, patch
 
 from companies_house_client import (
     AcademyTrustAnnualReport,
+    AnnualReport,
     CompaniesHouseApiError,
     CompaniesHouseClient,
+    CompanyGovernance,
+    CompanyMetadata,
     DetailedBalanceSheet,
+    DirectorAttendance,
     DocumentExtractionError,
     ExtractionResult,
     ExtractionType,
@@ -17,6 +21,7 @@ from companies_house_client import (
     OpenRouterDocumentExtractor,
     PersonnelDetail,
 )
+from company_type import CompanyType
 
 
 class DummyResponse:
@@ -874,6 +879,153 @@ class OpenRouterDocumentExtractorTests(unittest.TestCase):
         self.assertIn("staffing_data", schema["required"])
         self.assertNotIn("academy_trust_annual_report", schema["required"])
         self.assertNotIn("balance_sheet", schema["required"])
+
+    def test_extract_generic_annual_report(self):
+        extractor = OpenRouterDocumentExtractor(
+            api_key="or_key", company_type=CompanyType.GENERIC
+        )
+        llm_json = """
+        {
+          "annual_report": {
+            "metadata": {
+              "company_name": "ACME WIDGETS LTD",
+              "company_registration_number": "12345678",
+              "financial_year_ending": "2024-12-31",
+              "accounting_officer": "John Doe"
+            },
+            "governance": {
+              "directors": [
+                {"name": "Alice Smith", "meetings_attended": 10, "meetings_possible": 12}
+              ]
+            },
+            "statement_of_financial_activities": {
+              "income": {
+                "donations_and_capital_grants": null,
+                "charitable_activities_education": null,
+                "other_trading_activities": null,
+                "investments": null
+              },
+              "expenditure": {
+                "charitable_activities_education": null
+              }
+            },
+            "balance_sheet": {
+              "fixed_assets": 500000,
+              "current_assets": {
+                "debtors": 100000,
+                "cash_at_bank": 250000
+              },
+              "liabilities": {
+                "creditors_within_one_year": 75000,
+                "pension_scheme_liability": 25000
+              },
+              "net_assets": 750000
+            },
+            "staffing_data": {
+              "average_headcount_fte": 50,
+              "total_staff_costs": 2000000,
+              "high_pay_bands": []
+            }
+          }
+        }
+        """
+        response = {
+            "choices": [{"message": {"content": llm_json}}],
+        }
+        extractor._post_openrouter_chat_completion = Mock(return_value=response)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "full_accounts.txt")
+            with open(path, "w", encoding="utf-8") as fh:
+                fh.write("Sample full accounts text")
+
+            result = extractor.extract(
+                path,
+                extraction_types=[ExtractionType.AnnualReport],
+            )
+
+        self.assertIsNotNone(result.annual_report)
+        self.assertIsInstance(result.annual_report, AnnualReport)
+        self.assertIsInstance(result.annual_report.metadata, CompanyMetadata)
+        self.assertEqual(result.annual_report.metadata.company_name, "ACME WIDGETS LTD")
+        self.assertEqual(
+            result.annual_report.metadata.company_registration_number, "12345678"
+        )
+        self.assertIsInstance(result.annual_report.governance, CompanyGovernance)
+        self.assertEqual(len(result.annual_report.governance.directors), 1)
+        self.assertIsInstance(
+            result.annual_report.governance.directors[0], DirectorAttendance
+        )
+        self.assertEqual(
+            result.annual_report.governance.directors[0].meetings_attended, 10
+        )
+        self.assertEqual(
+            result.annual_report.balance_sheet.current_assets.cash_at_bank, 250000
+        )
+        payload = extractor._post_openrouter_chat_completion.call_args[1]["payload"]
+        schema = payload["response_format"]["json_schema"]["schema"]
+        self.assertIn("annual_report", schema["required"])
+        report_props = schema["properties"]["annual_report"]["properties"]
+        self.assertIn("company_name", report_props["metadata"]["properties"])
+        self.assertIn("directors", report_props["governance"]["properties"])
+        self.assertEqual(
+            report_props["metadata"]["properties"]["company_registration_number"]["pattern"],
+            "^(?:[0-9]{8}|[A-Za-z]{2}[0-9]{6})$",
+        )
+
+    def test_extract_generic_annual_report_accepts_prefixed_company_number(self):
+        extractor = OpenRouterDocumentExtractor(
+            api_key="or_key", company_type=CompanyType.GENERIC
+        )
+        llm_json = """
+        {
+          "annual_report": {
+            "metadata": {
+              "company_name": "ACME SCOTLAND LTD",
+              "company_registration_number": "sc123456",
+              "financial_year_ending": "2024-12-31",
+              "accounting_officer": "John Doe"
+            },
+            "governance": {"directors": []},
+            "statement_of_financial_activities": {"income": {}, "expenditure": {}},
+            "balance_sheet": {
+              "fixed_assets": null,
+              "current_assets": null,
+              "liabilities": null,
+              "net_assets": null
+            },
+            "staffing_data": {"average_headcount_fte": null, "total_staff_costs": null, "high_pay_bands": []}
+          }
+        }
+        """
+        response = {"choices": [{"message": {"content": llm_json}}]}
+        extractor._post_openrouter_chat_completion = Mock(return_value=response)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "full_accounts.txt")
+            with open(path, "w", encoding="utf-8") as fh:
+                fh.write("Sample full accounts text")
+
+            result = extractor.extract(path, extraction_types=[ExtractionType.AnnualReport])
+
+        self.assertEqual(
+            result.annual_report.metadata.company_registration_number,
+            "SC123456",
+        )
+
+    def test_generic_company_type_prompts_use_company_terms(self):
+        _, user_prompt = OpenRouterDocumentExtractor._build_prompts(
+            [ExtractionType.AnnualReport], CompanyType.GENERIC
+        )
+        self.assertIn("annual_report", user_prompt)
+        self.assertIn("annual report sections", user_prompt)
+
+    def test_academy_trust_company_type_prompts_use_trust_terms(self):
+        _, user_prompt = OpenRouterDocumentExtractor._build_prompts(
+            [ExtractionType.AcademyTrustAnnualReport], CompanyType.ACADEMY_TRUST
+        )
+        self.assertIn("academy_trust_annual_report", user_prompt)
+        self.assertIn("academy trust report sections", user_prompt)
 
     def test_extract_rejects_missing_personnel_fields(self):
         extractor = OpenRouterDocumentExtractor(api_key="or_key")

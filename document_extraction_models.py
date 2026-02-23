@@ -57,6 +57,7 @@ class ExtractionType(Enum):
     DetailedBalanceSheet = "detailed_balance_sheet"
     StaffingData = "staffing_data"
     AcademyTrustAnnualReport = "academy_trust_annual_report"
+    AnnualReport = "annual_report"
 
 
 class PersonnelDetail(BaseModel):
@@ -287,6 +288,91 @@ class AcademyTrustAnnualReport(BaseModel):
     staffing_data: StaffingData | None = None
 
 
+class CompanyMetadata(BaseModel):
+    """Generic company metadata (uses company_name instead of trust_name)."""
+
+    model_config = ConfigDict(extra="ignore")
+
+    company_name: str
+    company_registration_number: str
+    financial_year_ending: str
+    accounting_officer: str | None = None
+
+    @field_validator(
+        "company_name",
+        "company_registration_number",
+        "financial_year_ending",
+        "accounting_officer",
+    )
+    @classmethod
+    def _optional_trimmed(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        cleaned = str(value).strip()
+        return cleaned or None
+
+    @field_validator("company_name", "company_registration_number", "financial_year_ending")
+    @classmethod
+    def _required_non_empty(cls, value: str | None) -> str:
+        cleaned = str(value or "").strip()
+        if not cleaned:
+            raise ValueError("must not be empty")
+        return cleaned
+
+    @field_validator("company_registration_number")
+    @classmethod
+    def _company_number_must_be_valid_uk_format(cls, value: str) -> str:
+        normalized = value.upper()
+        if not re.fullmatch(r"(?:\d{8}|[A-Z]{2}\d{6})", normalized):
+            raise ValueError(
+                "must be an 8-digit number or a 2-letter prefix followed by 6 digits"
+            )
+        return normalized
+
+
+class DirectorAttendance(BaseModel):
+    """Generic governance member attendance (equivalent to TrusteeAttendance)."""
+
+    model_config = ConfigDict(extra="ignore")
+
+    name: str | None = None
+    meetings_attended: int | None = None
+    meetings_possible: int | None = None
+
+    @field_validator("name")
+    @classmethod
+    def _optional_name_trimmed(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        cleaned = str(value).strip()
+        return cleaned or None
+
+    @field_validator("meetings_attended", "meetings_possible", mode="before")
+    @classmethod
+    def _optional_meeting_counts(cls, value: object) -> int | None:
+        return _coerce_accounting_int(value)
+
+
+class CompanyGovernance(BaseModel):
+    """Generic governance model (uses directors instead of trustees)."""
+
+    model_config = ConfigDict(extra="ignore")
+
+    directors: list[DirectorAttendance] = Field(default_factory=list)
+
+
+class AnnualReport(BaseModel):
+    """Generic annual report model for any company type."""
+
+    model_config = ConfigDict(extra="ignore")
+
+    metadata: CompanyMetadata | None = None
+    governance: CompanyGovernance | None = None
+    statement_of_financial_activities: StatementOfFinancialActivities | None = None
+    balance_sheet: DetailedBalanceSheet | None = None
+    staffing_data: StaffingData | None = None
+
+
 class ExtractionResult(BaseModel):
     model_config = ConfigDict(extra="ignore")
 
@@ -295,12 +381,13 @@ class ExtractionResult(BaseModel):
     requested_types: list[ExtractionType]
     personnel_details: list[PersonnelDetail] | None = None
     balance_sheet: list[BalanceSheetEntry] | None = None
-    metadata: Metadata | None = None
-    governance: Governance | None = None
+    metadata: Metadata | CompanyMetadata | None = None
+    governance: Governance | CompanyGovernance | None = None
     statement_of_financial_activities: StatementOfFinancialActivities | None = None
     detailed_balance_sheet: DetailedBalanceSheet | None = None
     staffing_data: StaffingData | None = None
     academy_trust_annual_report: AcademyTrustAnnualReport | None = None
+    annual_report: AnnualReport | None = None
     validation_warnings: list[str] = Field(default_factory=list)
 
     @field_validator("source_path", "model")
@@ -314,10 +401,14 @@ class ExtractionResult(BaseModel):
 
 __all__ = [
     "AcademyTrustAnnualReport",
+    "AnnualReport",
     "BalanceSheetEntry",
+    "CompanyGovernance",
+    "CompanyMetadata",
     "DetailedBalanceSheet",
     "DetailedBalanceSheetCurrentAssets",
     "DetailedBalanceSheetLiabilities",
+    "DirectorAttendance",
     "ExtractionResult",
     "ExtractionType",
     "FundBreakdown",

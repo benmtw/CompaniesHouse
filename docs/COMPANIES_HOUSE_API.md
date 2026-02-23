@@ -260,10 +260,9 @@ After confirming this file and your scripts are enough, you can remove the saved
 
 Keep:
 - `.env`
-- `companieshouse_fetch.ps1`
-- `run_companieshouse.bat`
-- `COMPANIES_HOUSE_API.md`
-- Optional: `swagger.json` and `swagger (1).json` as machine-readable backups
+- `docs/COMPANIES_HOUSE_API.md`
+
+Legacy scripts and API specs have been moved to `docs/archive/`.
 
 ## 11) LLM Document Extraction (OpenRouter SDK)
 
