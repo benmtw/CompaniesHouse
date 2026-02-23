@@ -1075,7 +1075,6 @@ def main_prefect() -> int:
         company_type=args.company_type,
         db_path=args.db_path,
         fallback_models=args.fallback_models,
-        ch_min_request_interval_seconds=args.ch_min_request_interval_seconds,
         write_summary_json=args.write_summary_json,
         summary_json_path=args.summary_json_path,
         filing_history_items_per_page=args.filing_history_items_per_page,
