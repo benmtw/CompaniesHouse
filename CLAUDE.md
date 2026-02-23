@@ -21,15 +21,17 @@ Companies House data extraction pipeline. Batch processes company filings from X
 
 | File | Purpose | Keep Updated |
 |------|---------|:---:|
-| `Prefect.md` | How to run and deploy Prefect workflows | Yes |
-| `COMPANIES_HOUSE_API.md` | API contract reference | Yes |
+| `docs/Prefect.md` | How to run and deploy Prefect workflows | Yes |
+| `docs/COMPANIES_HOUSE_API.md` | API contract reference | Yes |
+| `docs/MATFullTReportFormat.md` | MAT financial report JSON schema reference | -- |
 | `AGENTS.md` | Developer environment guidelines | Yes |
-| `PREFECT_CONVERSION_PLAN.md` | Internal architecture/migration plan | -- |
+
+Archived documentation (completed plans, incident reports, legacy scripts) is in `docs/archive/`.
 
 ## Documentation Maintenance Rules
 
-- When modifying Prefect flows, tasks, parameters, or deployments in `flows/` or `prefect.yaml`, **update `Prefect.md`** in the same commit
-- When modifying API client behavior in `companies_house_client.py`, **update `COMPANIES_HOUSE_API.md`**
+- When modifying Prefect flows, tasks, parameters, or deployments in `flows/` or `prefect.yaml`, **update `docs/Prefect.md`** in the same commit
+- When modifying API client behavior in `companies_house_client.py`, **update `docs/COMPANIES_HOUSE_API.md`**
 - When adding new project files or changing environment setup, **update `AGENTS.md`**
 - Keep documentation in sync with code -- do not merge code changes without corresponding doc updates
 
@@ -51,6 +53,11 @@ document_extraction_models.py       # Pydantic models for extraction schemas
 company_type.py                     # CompanyType enum (GENERIC, ACADEMY_TRUST)
 batch_extract_companies.py          # CLI entry point + XLSX reader
 test_companies_house_client.py      # Unit tests (mocked HTTP)
+docs/                               # Active documentation
+    COMPANIES_HOUSE_API.md          # API contract reference
+    Prefect.md                      # Prefect workflow guide
+    MATFullTReportFormat.md         # MAT financial report schema
+    archive/                        # Completed plans, reports, legacy scripts
 ```
 
 ## Testing
@@ -68,4 +75,4 @@ Before running flows, create the rate limiting concurrency limit:
 prefect gcl create companies-house-api --limit 1 --slot-decay-per-second 0.5
 ```
 
-See `Prefect.md` for full setup and deployment instructions.
+See `docs/Prefect.md` for full setup and deployment instructions.
